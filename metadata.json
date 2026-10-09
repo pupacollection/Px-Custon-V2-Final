@@ -1,0 +1,6 @@
+{
+  "name": "PX CUSTOM — Aplicativo Oficial",
+  "description": "Plataforma oficial da PX CUSTOM para divulgação de eventos automotivos, venda e emissão de ingressos digitais com QR Code, check-in e gestão PX CONTROL.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

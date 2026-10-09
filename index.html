@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="pt-BR" class="bg-black text-white">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>PX CUSTOM — Aplicativo Oficial</title>
+    <meta name="description" content="Plataforma oficial da PX CUSTOM para divulgação de eventos automotivos, venda e emissão de ingressos digitais com QR Code, check-in e gestão PX CONTROL." />
+    
+    <style>
+      html, body {
+        background-color: #000000 !important;
+        color: #FFFFFF !important;
+        margin: 0;
+        padding: 0;
+        min-height: 100vh;
+      }
+    </style>
+
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="PX CUSTOM — Aplicativo Oficial" />
+    <meta property="og:description" content="Plataforma oficial da PX CUSTOM para divulgação de eventos automotivos, venda e emissão de ingressos digitais com QR Code, check-in e gestão PX CONTROL." />
+    <meta property="og:image" content="/logo.svg" />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="PX CUSTOM — Aplicativo Oficial" />
+    <meta name="twitter:description" content="Plataforma oficial da PX CUSTOM para divulgação de eventos automotivos, venda e emissão de ingressos digitais com QR Code, check-in e gestão PX CONTROL." />
+    <meta name="twitter:image" content="/logo.svg" />
+
+    <!-- PWA & Mobile Web -->
+    <meta name="theme-color" content="#000000" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="PX CUSTOM" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/favicon.svg" />
+    <link rel="manifest" href="/manifest.json" />
+
+    <!-- Typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,400;0,600;0,700;0,800;0,900;1,800;1,900&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  </head>
+  <body class="bg-black text-white antialiased selection:bg-[#FF1A2D] selection:text-white min-h-screen">
+    <div id="root">
+      <div style="min-height: 100vh; background-color: #000000; color: #ffffff; display: flex; align-items: center; justify-content: center; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+        <div style="text-align: center; padding: 20px;">
+          <div style="color: #FF1A2D; font-weight: 900; font-size: 26px; letter-spacing: 2px; font-family: 'Montserrat', sans-serif;">PX CUSTOM</div>
+          <div style="display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 12px;">
+            <div style="width: 8px; height: 8px; border-radius: 50%; background-color: #FF1A2D;"></div>
+            <span style="color: #888888; font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px;">Carregando Ecossistema...</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // Desativa e desregistra service workers em ambiente de desenvolvimento/preview
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistrations().then(function(registrations) {
+          for (var reg of registrations) {
+            reg.unregister();
+          }
+        }).catch(function() {});
+      }
+    </script>
+  </body>
+</html>

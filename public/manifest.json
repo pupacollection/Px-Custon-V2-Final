@@ -1,0 +1,26 @@
+{
+  "id": "/",
+  "name": "PX CUSTOM — Aplicativo Oficial",
+  "short_name": "PX CUSTOM",
+  "description": "Plataforma oficial da PX CUSTOM para divulgação de eventos automotivos, ingressos digitais e PX CONTROL.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/favicon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}

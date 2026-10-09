@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500" width="100%" height="100%">
+  <defs>
+    <!-- Grunge filter for the authentic distressed PX CUSTOM look -->
+    <filter id="distress" x="-10%" y="-10%" width="120%" height="120%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.04" numOctaves="3" result="noise" />
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="3" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+  </defs>
+
+  <!-- Black Background -->
+  <rect width="500" height="500" fill="#000000" />
+
+  <g transform="translate(45, 100)">
+    <!-- 1. LEFT EMBLEM: Stylized Automotive / Audio Headphone Crescent Arc -->
+    <!-- Outer Crescent -->
+    <path d="M 68 55 
+             C 42 78, 22 118, 22 165 
+             C 22 220, 52 268, 92 288 
+             C 86 280, 78 266, 75 250 
+             C 65 240, 55 210, 55 170 
+             C 55 125, 78 85, 102 62 
+             Z" 
+          fill="#FFFFFF" />
+
+    <!-- Secondary outer band / accent notch -->
+    <path d="M 45 105 
+             C 32 125, 26 150, 26 178 
+             C 26 215, 38 245, 52 265 
+             C 45 252, 38 226, 38 185 
+             C 38 152, 44 125, 52 105 
+             Z" 
+          fill="#FFFFFF" opacity="0.9" />
+
+    <!-- Inner Crescent Contour -->
+    <path d="M 98 48 
+             C 122 62, 145 92, 148 135 
+             C 136 100, 115 72, 88 60 
+             C 82 85, 80 135, 88 185 
+             C 98 240, 125 272, 155 288 
+             C 132 284, 105 264, 92 230 
+             C 78 190, 76 130, 85 82 
+             Z" 
+          fill="#FFFFFF" />
+
+    <!-- Bottom aerodynamic fin / claw cut -->
+    <path d="M 65 260 
+             C 75 285, 95 305, 125 315 
+             C 105 310, 85 295, 74 275 
+             Z" 
+          fill="#FFFFFF" />
+    <path d="M 125 305 
+             C 142 308, 160 300, 172 285 
+             C 155 295, 138 295, 125 290 
+             Z" 
+          fill="#FFFFFF" />
+
+    <!-- 2. LETTER P: Bold Distressed White Block Letter -->
+    <g fill="#FFFFFF">
+      <!-- P Stem and Loop -->
+      <path d="M 145 125 
+               L 205 125 
+               C 232 125, 248 140, 248 165 
+               C 248 190, 230 205, 202 205 
+               L 174 205 
+               L 174 275 
+               L 145 275 
+               Z 
+               M 174 150 
+               L 174 180 
+               L 200 180 
+               C 214 180, 220 174, 220 165 
+               C 220 156, 214 150, 200 150 
+               Z" />
+    </g>
+
+    <!-- 3. LETTER X: Vivid Intense Red with Arrowhead on Bottom-Left Leg -->
+    <g fill="#FF1A2D">
+      <!-- Top-Left to Bottom-Right Stroke -->
+      <polygon points="242,146 270,146 338,275 305,275" />
+      
+      <!-- Top-Right to Bottom-Left Stroke with Arrowhead -->
+      <!-- Upper part -->
+      <polygon points="318,146 348,146 276,268 250,268" />
+      <!-- Arrow tip pointing down-left -->
+      <path d="M 276 265 
+               L 220 288 
+               L 242 225 
+               L 255 248 
+               L 282 205 
+               L 298 218 
+               L 268 260 
+               Z" />
+    </g>
+
+    <!-- 4. RED HORIZONTAL PULSE / HEARTBEAT / SOUND WAVE LINE -->
+    <path d="M 130 248 
+             L 295 248 
+             L 310 215 
+             L 322 282 
+             L 336 215 
+             L 348 282 
+             L 362 230 
+             L 370 258 
+             L 378 248 
+             L 425 248" 
+          stroke="#FF1A2D" 
+          stroke-width="7" 
+          stroke-linecap="square" 
+          stroke-linejoin="miter" 
+          fill="none" />
+
+    <!-- 5. TEXT "CUSTOM": Distressed Bold White Uppercase -->
+    <text x="268" y="320" 
+          font-family="system-ui, -apple-system, 'Impact', 'Montserrat', 'Arial Black', sans-serif" 
+          font-weight="900" 
+          font-size="44" 
+          letter-spacing="5" 
+          fill="#FFFFFF">CUSTOM</text>
+  </g>
+</svg>

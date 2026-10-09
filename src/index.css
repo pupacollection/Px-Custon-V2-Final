@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --px-black: #000000;
+    --px-dark: #080808;
+    --px-graphite: #111111;
+    --px-graphite-2: #181818;
+    --px-white: #FFFFFF;
+    --px-red-primary: #FF1A2D;
+    --px-red-dark: #C90018;
+    --px-red-light: #FF3344;
+  }
+
+  body {
+    background-color: #000000;
+    color: #FFFFFF;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    overflow-x: hidden;
+  }
+
+  h1, h2, h3, h4, .font-heading {
+    font-family: 'Montserrat', system-ui, -apple-system, sans-serif;
+    letter-spacing: -0.02em;
+  }
+}
+
+/* Custom dark automotive scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #080808;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #222222;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #FF1A2D;
+}
+
+/* Automotive red neon glow utilities */
+.glow-red {
+  box-shadow: 0 0 20px rgba(255, 26, 45, 0.45);
+}
+
+.glow-red-sm {
+  box-shadow: 0 0 10px rgba(255, 26, 45, 0.3);
+}
+
+.glow-red-text {
+  text-shadow: 0 0 12px rgba(255, 26, 45, 0.6);
+}
+
+/* Scanner beam animation */
+@keyframes scanline {
+  0% {
+    top: 5%;
+    opacity: 0.8;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    top: 90%;
+    opacity: 0.8;
+  }
+}
+
+.animate-scanline {
+  animation: scanline 2.2s ease-in-out infinite alternate;
+}
+

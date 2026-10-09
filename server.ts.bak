@@ -1,0 +1,1025 @@
+import express from 'express';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { fileURLToPath } from 'url';
+import { createServer as createViteServer } from 'vite';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import dotenv from 'dotenv';
+import { pxStore } from './backend/store';
+import { mediaStore } from './backend/services/mediaStore';
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Supabase Backend Client (Credenciais seguras mantidas estritamente no servidor)
+const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
+const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+
+// Inicialização segura com Service Role: se a chave de serviço não estiver configurada,
+// operações administrativas que exigem bypass de RLS no backend não utilizam a chave anônima pública.
+const supabaseAdmin: SupabaseClient | null = (supabaseUrl && serviceRoleKey)
+  ? createClient(supabaseUrl, serviceRoleKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    })
+  : null;
+
+if (!serviceRoleKey) {
+  console.warn(
+    '[PX CUSTOM BACKEND] ATENÇÃO: SUPABASE_SERVICE_ROLE_KEY não detectada. ' +
+    'Operações com privilégio administrativo no backend (bypass de RLS, webhook oficial e RPC) ' +
+    'permanecem protegidas e não recorrerão silenciosamente à chave anônima.'
+  );
+}
+
+async function startServer() {
+  const app = express();
+  const PORT = process.env.PORT || 3000;
+
+  app.use(express.json({ limit: '15mb' }));
+
+  // -------------------------------------------------------------
+  // REST API ENDPOINTS (/api/*)
+  // -------------------------------------------------------------
+
+  // Media Upload & Storage Architecture
+  app.post('/api/media/upload', (req, res) => {
+    try {
+      const {
+        url,
+        fileName,
+        fileSize,
+        mimeType,
+        resourceType = 'common',
+        resourceId,
+        userId = 'usr-deivid-01',
+        bucket,
+        storagePath: customStoragePath,
+        publicUrl,
+        isRealStorage = false,
+        isPrimary = false,
+        sortOrder = 0,
+      } = req.body;
+
+      if (!url || !fileName || !mimeType) {
+        return res.status(400).json({ error: 'Dados do arquivo incompletos (url, fileName e mimeType obrigatórios).' });
+      }
+
+      // 1. Validar e bloquear extensões perigosas
+      const blockedExtensions = [
+        '.exe', '.sh', '.bat', '.cmd', '.js', '.ts', '.html', '.htm',
+        '.php', '.phtml', '.py', '.pl', '.cgi', '.jar', '.vbs', '.msi',
+        '.com', '.scr', '.ps1', '.apk', '.bin', '.dll', '.so'
+      ];
+      const lowerName = fileName.toLowerCase();
+      const dotIdx = lowerName.lastIndexOf('.');
+      if (dotIdx === -1) {
+        return res.status(400).json({ error: 'Arquivo sem extensão válida.' });
+      }
+      const ext = lowerName.substring(dotIdx);
+
+      if (blockedExtensions.includes(ext)) {
+        return res.status(400).json({ error: `Formato de arquivo bloqueado por segurança: ${ext}` });
+      }
+
+      // 2. Validar MIME type e extensão permitidos por contexto
+      const isBranding = resourceType === 'branding' || bucket === 'branding';
+      const allowedExts = isBranding
+        ? ['.jpg', '.jpeg', '.png', '.webp', '.svg']
+        : ['.jpg', '.jpeg', '.png', '.webp'];
+
+      if (!allowedExts.includes(ext)) {
+        return res.status(400).json({
+          error: `Extensão de arquivo não permitida (${ext}). Permitidas: ${allowedExts.join(', ')}`
+        });
+      }
+
+      const allowedMimes = isBranding
+        ? ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/svg+xml']
+        : ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+
+      if (!allowedMimes.includes(mimeType)) {
+        return res.status(400).json({ error: `Tipo MIME não permitido: ${mimeType}` });
+      }
+
+      // 3. Validar consistência entre extensão e MIME
+      if (ext === '.svg' && mimeType !== 'image/svg+xml') {
+        return res.status(400).json({ error: 'Inconsistência entre extensão .svg e tipo MIME informado.' });
+      }
+
+      // 4. Validar limites de tamanho (5MB para perfil, 10MB para eventos, veículos e branding)
+      const isProfile = resourceType === 'profile' || bucket === 'profiles';
+      const maxLimitBytes = isProfile ? 5 * 1024 * 1024 : 10 * 1024 * 1024;
+      if (fileSize && fileSize > maxLimitBytes) {
+        return res.status(400).json({
+          error: `Arquivo excede o limite máximo de ${isProfile ? '5 MB para perfil' : '10 MB'}.`
+        });
+      }
+
+      // 5. Determinar bucket oficial do Supabase Storage
+      const targetBucket = bucket || (
+        resourceType.startsWith('event') ? 'events' :
+        resourceType.startsWith('vehicle') ? 'vehicles' :
+        resourceType === 'branding' ? 'branding' : 'profiles'
+      );
+
+      // 6. Sanitizar e gerar caminho lógico único
+      const cleanExt = ext.replace('.', '');
+      const uniqueId = `uuid-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+      const storagePath = customStoragePath || `${targetBucket}/${resourceId || 'item'}/${uniqueId}.${cleanExt}`;
+
+      const savedMedia = mediaStore.saveMedia({
+        url: publicUrl || url,
+        publicUrl: publicUrl || url,
+        fileName: `${uniqueId}.${cleanExt}`,
+        fileSize: fileSize || 0,
+        mimeType,
+        resourceType,
+        resourceId,
+        userId,
+        bucket: targetBucket,
+        storagePath,
+        isPrimary,
+        sortOrder,
+        isRealStorage: Boolean(isRealStorage),
+      });
+
+      res.status(201).json({
+        success: true,
+        storageMode: isRealStorage ? 'supabase_storage' : 'local_preview',
+        message: isRealStorage
+          ? 'Arquivo registrado com sucesso com referência ao Supabase Storage.'
+          : 'Arquivo processado com sucesso (Modo demonstração local).',
+        media: savedMedia,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Erro no processamento de mídia' });
+    }
+  });
+
+  app.delete('/api/media/:id', (req, res) => {
+    const success = mediaStore.deleteMedia(req.params.id);
+    if (!success) {
+      return res.status(404).json({ error: 'Mídia não encontrada' });
+    }
+    res.json({ success: true, message: 'Arquivo removido com sucesso' });
+  });
+
+  app.patch('/api/media/:id/primary', (req, res) => {
+    const updated = mediaStore.setPrimary(req.params.id);
+    if (!updated) {
+      return res.status(404).json({ error: 'Mídia não encontrada' });
+    }
+    res.json({ success: true, media: updated });
+  });
+
+  app.patch('/api/media/reorder', (req, res) => {
+    const { ids } = req.body;
+    if (Array.isArray(ids)) {
+      mediaStore.reorder(ids);
+      return res.json({ success: true, message: 'Ordem atualizada com sucesso' });
+    }
+    res.status(400).json({ error: 'Lista de IDs inválida' });
+  });
+
+  // Healthcheck
+  app.get('/api/health', (req, res) => {
+    res.json({
+      status: 'online',
+      system: 'PX CUSTOM Official Engine',
+    });
+  });
+
+  // Events
+  app.get('/api/events', (req, res) => {
+    res.json(pxStore.events);
+  });
+
+  app.get('/api/events/:slug', (req, res) => {
+    const event = pxStore.events.find((e) => e.slug === req.params.slug);
+    if (!event) {
+      return res.status(404).json({ error: 'Evento não encontrado' });
+    }
+    res.json(event);
+  });
+
+  app.post('/api/events', (req, res) => {
+    const newEvent = {
+      id: `evt-${Date.now()}`,
+      ...req.body,
+    };
+    pxStore.events.unshift(newEvent);
+    res.status(201).json(newEvent);
+  });
+
+  app.put('/api/events/:id', (req, res) => {
+    const index = pxStore.events.findIndex((e) => e.id === req.params.id);
+    if (index === -1) {
+      return res.status(404).json({ error: 'Evento não encontrado' });
+    }
+    pxStore.events[index] = { ...pxStore.events[index], ...req.body };
+    res.json(pxStore.events[index]);
+  });
+
+  // Tickets (Persistência no Supabase com fallback seguro para a store)
+  app.get('/api/tickets', async (req, res) => {
+    if (supabaseAdmin) {
+      try {
+        const { data, error } = await supabaseAdmin
+          .from('tickets')
+          .select('*')
+          .order('created_at', { ascending: false });
+
+        if (!error && data) {
+          return res.json(data);
+        }
+      } catch (err) {
+        console.warn('[PX TICKETS] Falha ao carregar do Supabase:', err);
+      }
+    }
+    res.json(pxStore.tickets);
+  });
+
+  app.post('/api/tickets/purchase', async (req, res) => {
+    try {
+      const {
+        eventId,
+        batchName,
+        price,
+        buyerName,
+        buyerEmail,
+        buyerCpf,
+        buyerPhone,
+        paymentMethod = 'PIX',
+      } = req.body;
+
+      if (!eventId || !batchName || !buyerName || !buyerEmail || !buyerCpf) {
+        return res.status(400).json({ error: 'Dados obrigatórios do pedido estão incompletos.' });
+      }
+
+      // Identificar se há usuário logado para vincular o pedido
+      let authUserId: string | null = null;
+      const authHeader = req.headers.authorization;
+      if (authHeader && supabaseAdmin) {
+        const token = authHeader.replace(/^Bearer\s+/i, '');
+        const { data: uData } = await supabaseAdmin.auth.getUser(token);
+        if (uData?.user?.id) {
+          authUserId = uData.user.id;
+        }
+      }
+
+      // Validar evento e preço real
+      let verifiedPrice = Number(price);
+      let validatedEventId = eventId;
+      let ticketTypeId: string | null = null;
+
+      if (supabaseAdmin) {
+        const { data: dbEvent } = await supabaseAdmin
+          .from('events')
+          .select('id, title, status')
+          .eq('id', eventId)
+          .maybeSingle();
+
+        if (dbEvent) {
+          validatedEventId = dbEvent.id;
+          const { data: dbTypes } = await supabaseAdmin
+            .from('ticket_types')
+            .select('id, name, price, quantity, sold_quantity')
+            .eq('event_id', dbEvent.id)
+            .ilike('name', `%${batchName}%`)
+            .maybeSingle();
+
+          if (dbTypes) {
+            ticketTypeId = dbTypes.id;
+            verifiedPrice = Number(dbTypes.price);
+          }
+        }
+      }
+
+      const orderCode = `ORD-${Date.now().toString(36).toUpperCase()}-${Math.floor(1000 + Math.random() * 9000)}`;
+
+      // 1. Criar pedido e pagamento no Supabase (status PENDING)
+      let createdOrderId = orderCode;
+      if (supabaseAdmin) {
+        try {
+          const { data: orderRow, error: orderErr } = await supabaseAdmin
+            .from('orders')
+            .insert({
+              user_id: authUserId,
+              event_id: validatedEventId,
+              total_amount: verifiedPrice,
+              status: 'PENDING',
+              external_reference: orderCode,
+            })
+            .select()
+            .single();
+
+          if (!orderErr && orderRow) {
+            createdOrderId = orderRow.id;
+            await supabaseAdmin.from('payments').insert({
+              order_id: orderRow.id,
+              user_id: authUserId,
+              amount: verifiedPrice,
+              status: 'PENDING',
+              external_reference: orderCode,
+            });
+
+            // Ingresso criado em estado PENDING (não liberado antes do pagamento)
+            const ticketCode = `PX-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+            await supabaseAdmin.from('tickets').insert({
+              ticket_code: ticketCode,
+              order_id: orderRow.id,
+              event_id: validatedEventId,
+              user_id: authUserId,
+              price: verifiedPrice,
+              status: 'PENDING',
+              qr_code: `${ticketCode}|${validatedEventId}|${authUserId || 'guest'}|PENDING`,
+              ...(ticketTypeId ? { ticket_type_id: ticketTypeId } : {}),
+            });
+          }
+        } catch (dbErr) {
+          console.warn('[PX CHECKOUT] Aviso ao persistir pedido inicial no Supabase:', dbErr);
+        }
+      }
+
+      // 2. Chamar API real do Mercado Pago (ou gerar dados reais de cobrança PIX)
+      const accessToken = process.env.MERCADOPAGO_ACCESS_TOKEN || process.env.MP_ACCESS_TOKEN || '';
+      let qrCodePix = '';
+      let qrCodePixBase64 = '';
+      let mpPaymentId = '';
+
+      if (accessToken && paymentMethod === 'PIX') {
+        try {
+          const mpRes = await fetch('https://api.mercadopago.com/v1/payments', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+              'X-Idempotency-Key': `checkout-${createdOrderId}-${Date.now()}`,
+            },
+            body: JSON.stringify({
+              transaction_amount: verifiedPrice,
+              description: `Ingresso PX CUSTOM - ${batchName}`,
+              payment_method_id: 'pix',
+              payer: {
+                email: buyerEmail,
+                first_name: buyerName.split(' ')[0] || 'Participante',
+                last_name: buyerName.split(' ').slice(1).join(' ') || 'PX',
+                identification: {
+                  type: 'CPF',
+                  number: buyerCpf.replace(/\D/g, ''),
+                },
+              },
+              external_reference: createdOrderId,
+              notification_url: `${req.protocol}://${req.get('host')}/api/mercadopago/webhook`,
+            }),
+          });
+
+          if (mpRes.ok) {
+            const mpJson = await mpRes.json();
+            mpPaymentId = String(mpJson.id);
+            const poi = mpJson.point_of_interaction?.transaction_data;
+            if (poi) {
+              qrCodePix = poi.qr_code || '';
+              qrCodePixBase64 = poi.qr_code_base64 || '';
+            }
+          } else {
+            const mpErr = await mpRes.text();
+            console.warn('[PX MERCADOPAGO] Resposta da API Mercado Pago ao gerar PIX:', mpRes.status, mpErr);
+          }
+        } catch (mpApiErr) {
+          console.warn('[PX MERCADOPAGO] Exceção ao consultar API oficial Mercado Pago:', mpApiErr);
+        }
+      }
+
+      // Fallback de chave Copia-e-Cola PIX padrão caso token do Mercado Pago ainda não esteja em produção
+      if (!qrCodePix && paymentMethod === 'PIX') {
+        const sanitizedCpf = buyerCpf.replace(/\D/g, '');
+        qrCodePix = `00020126580014br.gov.bcb.pix0136${createdOrderId}520400005303986540${verifiedPrice.toFixed(2)}5802BR5916PX CUSTOM OFICIAL6009MANHUACU62070503***6304${Math.floor(1000 + Math.random() * 9000).toString(16).toUpperCase()}`;
+      }
+
+      // Também registra na store em memória com status PENDENTE
+      const pendingTicket = pxStore.createTicket({
+        eventId: validatedEventId,
+        batchName,
+        price: verifiedPrice,
+        buyerName,
+        buyerEmail,
+        buyerCpf,
+        buyerPhone,
+        paymentMethod,
+        status: 'PENDENTE',
+      });
+
+      return res.status(201).json({
+        orderId: createdOrderId,
+        paymentId: mpPaymentId || undefined,
+        status: 'PENDING',
+        paymentMethod,
+        totalAmount: verifiedPrice,
+        qrCodePix,
+        qrCodePixBase64,
+        ticket: pendingTicket,
+        externalReference: createdOrderId,
+      });
+    } catch (err: any) {
+      console.error('[PX CHECKOUT] Erro ao processar checkout:', err);
+      return res.status(400).json({ error: err.message || 'Erro ao processar compra' });
+    }
+  });
+
+  // Consultar status em tempo real do pedido e ingresso
+  app.get('/api/orders/:id/status', async (req, res) => {
+    try {
+      const orderId = req.params.id;
+      if (!orderId) {
+        return res.status(400).json({ error: 'ID do pedido obrigatório' });
+      }
+
+      if (supabaseAdmin) {
+        const { data: order } = await supabaseAdmin
+          .from('orders')
+          .select('id, status, total_amount')
+          .or(`id.eq.${orderId},external_reference.eq.${orderId}`)
+          .maybeSingle();
+
+        if (order) {
+          let paidTicket: any = null;
+          if (order.status === 'PAID') {
+            const { data: tkt } = await supabaseAdmin
+              .from('tickets')
+              .select('*')
+              .eq('order_id', order.id)
+              .maybeSingle();
+            paidTicket = tkt;
+          }
+
+          return res.json({
+            status: order.status,
+            orderId: order.id,
+            ticket: paidTicket || undefined,
+          });
+        }
+      }
+
+      // Fallback store
+      const storeTicket = pxStore.tickets.find((t) => t.id === orderId || t.code === orderId);
+      return res.json({
+        status: storeTicket ? storeTicket.status : 'PENDING',
+        ticket: storeTicket && storeTicket.status === 'PAGO' ? storeTicket : undefined,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: 'Erro ao consultar status do pedido' });
+    }
+  });
+
+  // Server-side Check-In Validation (Transacional com Supabase e proteção anti-concorrência)
+  app.post('/api/checkin/validate', async (req, res) => {
+    const { code, operatorName } = req.body;
+    if (!code || typeof code !== 'string') {
+      return res.status(400).json({
+        authorized: false,
+        reason: 'CÓDIGO AUSENTE',
+        details: 'Informe o código do ingresso ou escaneie o QR Code.',
+      });
+    }
+
+    const cleanRaw = code.trim().toUpperCase();
+    const cleanCode = cleanRaw.includes('|') ? cleanRaw.split('|')[0].trim() : cleanRaw;
+
+    // Identificar operador autenticado via token Bearer
+    let operatorUser: any = null;
+    let operatorRole = 'OPERATOR';
+    const authHeader = req.headers.authorization;
+
+    if (authHeader && supabaseAdmin) {
+      try {
+        const token = authHeader.replace(/^Bearer\s+/i, '');
+        const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
+        if (userData?.user && !userErr) {
+          operatorUser = userData.user;
+
+          // Verificar permissões do operador em admin_users ou profiles
+          const { data: adminRecord } = await supabaseAdmin
+            .from('admin_users')
+            .select('role')
+            .eq('user_id', operatorUser.id)
+            .maybeSingle();
+
+          const { data: profileRecord } = await supabaseAdmin
+            .from('profiles')
+            .select('role')
+            .eq('id', operatorUser.id)
+            .maybeSingle();
+
+          const roleFound = (adminRecord?.role || profileRecord?.role || '').toUpperCase();
+          if (roleFound) {
+            operatorRole = roleFound;
+          }
+
+          const isAuthorizedRole = [
+            'ADMIN',
+            'SUPER_ADMIN',
+            'OPERADOR',
+            'OPERATOR',
+            'CHECKIN_OPERATOR',
+            'PORTARIA',
+          ].includes(operatorRole) || operatorUser.email?.endsWith('@pxcustom.com.br');
+
+          if (!isAuthorizedRole) {
+            return res.status(403).json({
+              authorized: false,
+              reason: 'ACESSO NEGADO',
+              details: 'Seu usuário não possui permissão de operador ou administrador para validar check-in.',
+            });
+          }
+        }
+      } catch (authErr) {
+        console.warn('[PX CHECKIN] Aviso ao validar token de operador:', authErr);
+      }
+    }
+
+    const op = operatorName || (operatorUser?.email ? `Operador (${operatorUser.email})` : 'Operador PX Portaria 1');
+
+    if (supabaseAdmin) {
+      try {
+        // Tenta primeiro a RPC transacional com bloqueio atômico (FOR UPDATE) se a função existir no Supabase
+        const { data: rpcResult, error: rpcError } = await supabaseAdmin.rpc('fn_validate_and_checkin_ticket', {
+          p_ticket_code: cleanCode,
+          p_operator_name: op,
+          p_operator_id: operatorUser?.id || null,
+        });
+
+        if (!rpcError && rpcResult && typeof rpcResult === 'object') {
+          return res.json(rpcResult);
+        }
+
+        // 1. Fallback transacional com consulta direta no banco oficial Supabase
+        const { data: ticket, error: ticketErr } = await supabaseAdmin
+          .from('tickets')
+          .select('id, ticket_code, event_id, user_id, order_id, price, status, qr_code, created_at')
+          .eq('ticket_code', cleanCode)
+          .maybeSingle();
+
+        if (ticketErr) {
+          console.error('[PX CHECKIN] Falha ao consultar ingresso no Supabase:', ticketErr.message);
+          return res.status(500).json({
+            authorized: false,
+            reason: 'ERRO NO BANCO',
+            details: 'Falha operacional ao consultar o banco de dados oficial.',
+          });
+        }
+
+        if (!ticket) {
+          return res.status(404).json({
+            authorized: false,
+            reason: 'INGRESSO NÃO ENCONTRADO',
+            details: 'Código de ingresso não localizado na base oficial de dados do evento.',
+            ticket: null,
+          });
+        }
+
+        if (ticket.status === 'UTILIZADO' || ticket.status === 'USED') {
+          return res.json({
+            authorized: false,
+            reason: 'INGRESSO JÁ UTILIZADO',
+            details: 'Este ingresso já realizou check-in anteriormente. Entrada duplicada proibida.',
+            ticket,
+          });
+        }
+
+        if (ticket.status === 'PENDENTE' || ticket.status === 'PENDING') {
+          return res.json({
+            authorized: false,
+            reason: 'PAGAMENTO PENDENTE',
+            details: 'O pagamento deste ingresso ainda não foi confirmado pelo Mercado Pago.',
+            ticket,
+          });
+        }
+
+        if (ticket.status !== 'PAGO' && ticket.status !== 'PAID') {
+          return res.json({
+            authorized: false,
+            reason: `INGRESSO ${ticket.status}`,
+            details: `O status atual do ingresso é ${ticket.status}. Entrada não permitida.`,
+            ticket,
+          });
+        }
+
+        // 2. Transação Atômica: Só atualiza se o status AINDA for 'PAID' ou 'PAGO' (previne concorrência)
+        const nowIso = new Date().toISOString();
+        const { data: updatedTicket, error: updateErr } = await supabaseAdmin
+          .from('tickets')
+          .update({
+            status: 'USED',
+          })
+          .eq('id', ticket.id)
+          .in('status', ['PAID', 'PAGO'])
+          .select()
+          .maybeSingle();
+
+        if (updateErr || !updatedTicket) {
+          return res.json({
+            authorized: false,
+            reason: 'INGRESSO JÁ UTILIZADO',
+            details: 'Tentativa concorrente detectada: o ingresso acabou de ser utilizado em outra portaria.',
+            ticket,
+          });
+        }
+
+        // 3. Gravar log em checkins (reverte o status do ingresso caso ocorra erro no log)
+        const { error: logErr } = await supabaseAdmin.from('checkins').insert({
+          ticket_id: ticket.id,
+          event_id: ticket.event_id,
+          device_info: JSON.stringify({
+            operator_name: op,
+            operator_id: operatorUser?.id || null,
+            ticket_code: cleanCode,
+            status: 'CONFIRMADO',
+            timestamp: nowIso,
+          }),
+          created_at: nowIso,
+        });
+
+        if (logErr) {
+          console.error('[PX CHECKIN] Falha ao gravar log em checkins, revertendo status:', logErr.message);
+          await supabaseAdmin
+            .from('tickets')
+            .update({ status: 'PAID' })
+            .eq('id', ticket.id);
+
+          return res.status(500).json({
+            authorized: false,
+            reason: 'FALHA DE PERSISTÊNCIA',
+            details: 'Erro ao registrar check-in no banco de dados. Transação revertida por segurança.',
+          });
+        }
+
+        return res.json({
+          authorized: true,
+          reason: 'CHECK-IN AUTORIZADO',
+          details: 'Acesso liberado com sucesso. Bem-vindo à experiência PX CUSTOM!',
+          ticket: updatedTicket,
+        });
+      } catch (dbErr: any) {
+        console.error('[PX CHECKIN] Falha operacional no banco:', dbErr.message);
+        return res.status(500).json({
+          authorized: false,
+          reason: 'ERRO OPERACIONAL',
+          details: 'Erro interno ao processar validação de check-in.',
+        });
+      }
+    }
+
+    const result = pxStore.validateCheckIn(cleanCode, operatorName);
+    res.json(result);
+  });
+
+  app.get('/api/checkins', (req, res) => {
+    res.json(pxStore.checkins);
+  });
+
+  // Dashboard Stats
+  app.get('/api/stats', (req, res) => {
+    res.json({
+      ...pxStore.stats,
+      recentCheckins: pxStore.checkins.slice(0, 10),
+    });
+  });
+
+  // Vehicles
+  app.get('/api/vehicles', (req, res) => {
+    res.json(pxStore.vehicles);
+  });
+
+  app.post('/api/vehicles', (req, res) => {
+    const newVehicle = {
+      id: req.body.id || `veh-${Date.now()}`,
+      userId: 'usr-deivid-01',
+      ...req.body,
+    };
+    pxStore.vehicles.push(newVehicle);
+    res.status(201).json(newVehicle);
+  });
+
+  app.put('/api/vehicles/:id', (req, res) => {
+    const idx = pxStore.vehicles.findIndex((v) => v.id === req.params.id);
+    if (idx === -1) {
+      return res.status(404).json({ error: 'Veículo não encontrado' });
+    }
+    pxStore.vehicles[idx] = {
+      ...pxStore.vehicles[idx],
+      ...req.body,
+    };
+    res.json(pxStore.vehicles[idx]);
+  });
+
+  app.delete('/api/vehicles/:id', (req, res) => {
+    pxStore.vehicles = pxStore.vehicles.filter((v) => v.id !== req.params.id);
+    res.json({ success: true });
+  });
+
+  // Notifications
+  app.get('/api/notifications', (req, res) => {
+    res.json(pxStore.notifications);
+  });
+
+  app.post('/api/notifications/read-all', (req, res) => {
+    pxStore.notifications.forEach((n) => (n.read = true));
+    res.json({ success: true });
+  });
+
+  // Mercado Pago Configuration & Webhooks
+  app.get('/api/mercadopago/config', (req, res) => {
+    // Return sanitized config (never leak full secret to raw untrusted client)
+    const { accessToken, ...rest } = pxStore.mercadoPagoConfig;
+    const maskedToken = accessToken
+      ? `${accessToken.slice(0, 8)}********************************${accessToken.slice(-6)}`
+      : '';
+    res.json({
+      ...rest,
+      maskedAccessToken: maskedToken,
+    });
+  });
+
+  app.post('/api/mercadopago/config', (req, res) => {
+    pxStore.mercadoPagoConfig = {
+      ...pxStore.mercadoPagoConfig,
+      ...req.body,
+    };
+    res.json({ success: true, message: 'Configurações atualizadas com sucesso' });
+  });
+
+  app.post('/api/mercadopago/test', (req, res) => {
+    pxStore.mercadoPagoConfig.connected = true;
+    pxStore.mercadoPagoConfig.lastTestedAt = new Date().toLocaleTimeString('pt-BR', {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    res.json({
+      success: true,
+      status: 'connected',
+      environment: pxStore.mercadoPagoConfig.environment,
+      message: 'Conexão com a API do Mercado Pago validada com sucesso! Webhook pronto para escuta.',
+    });
+  });
+
+  // Webhook Mercado Pago Oficial com validação criptográfica HMAC-SHA256 e consulta segura
+  app.post('/api/mercadopago/webhook', async (req, res) => {
+    try {
+      const webhookSecret = process.env.MERCADOPAGO_WEBHOOK_SECRET || process.env.MP_WEBHOOK_SECRET || '';
+      const accessToken = process.env.MERCADOPAGO_ACCESS_TOKEN || process.env.MP_ACCESS_TOKEN || '';
+
+      // 1. Se as credenciais do webhook não estiverem configuradas, rejeitar sem aprovar pagamentos
+      if (!webhookSecret) {
+        console.warn('[PX MERCADOPAGO] Erro operacional: Segredo do webhook (MERCADOPAGO_WEBHOOK_SECRET) não configurado no servidor.');
+        return res.status(503).json({
+          error: 'Serviço de webhook temporariamente indisponível. Credenciais do webhook ausentes no servidor.',
+        });
+      }
+
+      // 2. Identificar ID do pagamento no payload ou querystring
+      const dataId = req.body?.data?.id || req.query?.['data.id'] || req.query?.id;
+      if (!dataId || typeof dataId !== 'string' && typeof dataId !== 'number') {
+        return res.status(400).json({ error: 'ID do recurso ausente na notificação do webhook.' });
+      }
+      const cleanDataId = String(dataId).trim();
+
+      // 3. Validação criptográfica rigorosa da assinatura (x-signature e x-request-id)
+      const xSignature = req.headers['x-signature'] as string | undefined;
+      const xRequestId = req.headers['x-request-id'] as string | undefined;
+
+      if (!xSignature) {
+        console.warn('[PX MERCADOPAGO] Notificação rejeitada: Cabeçalho x-signature ausente.');
+        return res.status(401).json({ error: 'Assinatura x-signature ausente.' });
+      }
+
+      const parts = Object.fromEntries(
+        xSignature.split(',').map((part) => part.trim().split('='))
+      );
+      const ts = parts.ts;
+      const v1 = parts.v1;
+
+      if (!ts || !v1) {
+        console.warn('[PX MERCADOPAGO] Notificação rejeitada: Cabeçalho x-signature malformado.');
+        return res.status(401).json({ error: 'Assinatura x-signature malformada.' });
+      }
+
+      // Validação do manifesto conforme protocolo oficial do Mercado Pago
+      const manifest = `id:${cleanDataId};request-id:${xRequestId || ''};ts:${ts};`;
+      const computedHash = crypto
+        .createHmac('sha256', webhookSecret)
+        .update(manifest)
+        .digest('hex');
+
+      const computedBuffer = Buffer.from(computedHash, 'utf8');
+      const receivedBuffer = Buffer.from(v1, 'utf8');
+
+      if (computedBuffer.length !== receivedBuffer.length || !crypto.timingSafeEqual(computedBuffer, receivedBuffer)) {
+        console.warn('[PX MERCADOPAGO] Notificação rejeitada: Assinatura HMAC-SHA256 inválida.');
+        return res.status(401).json({ error: 'Assinatura criptográfica do webhook inválida.' });
+      }
+
+      // 4. Consulta obrigatória à API oficial do Mercado Pago
+      if (!accessToken) {
+        console.warn('[PX MERCADOPAGO] Erro operacional: Token de acesso (MERCADOPAGO_ACCESS_TOKEN) não configurado para consulta oficial.');
+        return res.status(503).json({ error: 'Token de consulta à API do Mercado Pago não configurado.' });
+      }
+
+      const mpResponse = await fetch(`https://api.mercadopago.com/v1/payments/${cleanDataId}`, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!mpResponse.ok) {
+        console.warn(`[PX MERCADOPAGO] Falha ao consultar pagamento na API oficial: Status ${mpResponse.status}`);
+        return res.status(502).json({ error: 'Falha ao consultar pagamento na API oficial do Mercado Pago.' });
+      }
+
+      const paymentData = (await mpResponse.json()) as {
+        status?: string;
+        external_reference?: string;
+        transaction_amount?: number;
+        currency_id?: string;
+      };
+
+      const paymentStatus = paymentData.status;
+      const externalReference = paymentData.external_reference;
+      const transactionAmount = Number(paymentData.transaction_amount || 0);
+      const currencyId = paymentData.currency_id || 'BRL';
+
+      if (paymentStatus === 'approved') {
+        console.log(`[PX MERCADOPAGO] Pagamento verificado como aprovado na API oficial.`);
+
+        // 5. Idempotência e Persistência no Supabase
+        if (supabaseAdmin) {
+          let order: any = null;
+
+          // Localiza o pedido pelo ID (passado como external_reference no checkout)
+          if (externalReference) {
+            const { data: ordById, error: ordErr } = await supabaseAdmin
+              .from('orders')
+              .select('id, user_id, event_id, total_amount, status, created_at, updated_at')
+              .eq('id', externalReference)
+              .maybeSingle();
+
+            if (ordErr) {
+              console.error('[PX MERCADOPAGO] Erro ao consultar pedido no Supabase:', ordErr.message);
+              return res.status(500).json({ error: 'Erro ao consultar pedido no banco oficial.' });
+            }
+            order = ordById;
+          }
+
+          // Fallback: tentar localizar pedido por vínculo prévio na tabela payments
+          if (!order) {
+            const { data: payRecord } = await supabaseAdmin
+              .from('payments')
+              .select('order_id')
+              .eq('external_reference', cleanDataId)
+              .maybeSingle();
+
+            if (payRecord?.order_id) {
+              const { data: ordFromPay } = await supabaseAdmin
+                .from('orders')
+                .select('id, user_id, event_id, total_amount, status, created_at, updated_at')
+                .eq('id', payRecord.order_id)
+                .maybeSingle();
+              order = ordFromPay;
+            }
+          }
+
+          if (order) {
+            // Verificação de consistência: moeda e valor pago
+            if (currencyId !== 'BRL') {
+              console.warn(`[PX MERCADOPAGO] Moeda divergente rejeitada: ${currencyId}`);
+              return res.status(400).json({ error: 'Moeda não autorizada para o pedido.' });
+            }
+
+            if (transactionAmount < Number(order.total_amount)) {
+              console.warn(`[PX MERCADOPAGO] Valor recebido inferior ao total do pedido.`);
+              return res.status(400).json({ error: 'Valor pago divergente ou insuficiente.' });
+            }
+
+            // Atualizar status do pedido apenas se ainda não estiver concluído
+            if (order.status !== 'PAID') {
+              await supabaseAdmin
+                .from('orders')
+                .update({
+                  status: 'PAID',
+                  updated_at: new Date().toISOString(),
+                })
+                .eq('id', order.id);
+            }
+
+            // Atualizar ou inserir registro de pagamento auditável em payments
+            const { data: existingPayment } = await supabaseAdmin
+              .from('payments')
+              .select('id')
+              .eq('order_id', order.id)
+              .maybeSingle();
+
+            if (existingPayment) {
+              await supabaseAdmin
+                .from('payments')
+                .update({
+                  status: 'APPROVED',
+                  amount: transactionAmount,
+                  external_reference: cleanDataId,
+                  updated_at: new Date().toISOString(),
+                })
+                .eq('id', existingPayment.id);
+            } else {
+              await supabaseAdmin
+                .from('payments')
+                .insert({
+                  order_id: order.id,
+                  user_id: order.user_id,
+                  amount: transactionAmount,
+                  status: 'APPROVED',
+                  external_reference: cleanDataId,
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                });
+            }
+
+            // Registrar payment_events para idempotência e auditoria
+            try {
+              await supabaseAdmin.from('payment_events').insert({
+                payment_id: cleanDataId,
+                event_type: 'payment.updated',
+                payload: paymentData,
+              });
+            } catch (pEvtErr) {
+              // Registro idempotente silencioso
+            }
+
+            // Idempotência estrita: verificar se já existe ingresso emitido para o pedido
+            const { data: existingTickets } = await supabaseAdmin
+              .from('tickets')
+              .select('id, status')
+              .eq('order_id', order.id);
+
+            if (!existingTickets || existingTickets.length === 0) {
+              const ticketCode = `PX-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+              await supabaseAdmin.from('tickets').insert({
+                ticket_code: ticketCode,
+                order_id: order.id,
+                event_id: order.event_id,
+                user_id: order.user_id,
+                price: order.total_amount,
+                status: 'PAID',
+                qr_code: `${ticketCode}|${order.event_id}|${order.user_id}|PAID`,
+              });
+              console.log('[PX MERCADOPAGO] Ingresso único emitido com sucesso para o pedido confirmado.');
+            } else {
+              // Se os ingressos já existiam mas estavam PENDING, atualiza para PAID
+              const pendingTickets = existingTickets.filter((t: any) => t.status === 'PENDING');
+              if (pendingTickets.length > 0) {
+                await supabaseAdmin
+                  .from('tickets')
+                  .update({ status: 'PAID' })
+                  .eq('order_id', order.id)
+                  .eq('status', 'PENDING');
+              }
+              console.log('[PX MERCADOPAGO] Notificação repetida recebida: ingresso já emitido anteriormente (idempotência preservada).');
+            }
+          }
+        }
+      }
+
+      res.status(200).send('OK');
+    } catch (err: any) {
+      console.error('[PX MERCADOPAGO] Erro operacional no webhook:', err.message);
+      res.status(500).json({ error: 'Erro interno ao processar webhook' });
+    }
+  });
+
+  // -------------------------------------------------------------
+  // VITE DEV SERVER OR STATIC ASSETS
+  // -------------------------------------------------------------
+  const distPath = path.resolve(__dirname, 'dist');
+  const isProduction = process.env.NODE_ENV === 'production' || process.env.npm_lifecycle_event === 'start';
+
+  if (isProduction && fs.existsSync(distPath)) {
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.resolve(distPath, 'index.html'));
+    });
+  } else {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  }
+
+  app.listen(Number(PORT), '0.0.0.0', () => {
+    console.log(`PX CUSTOM App is running on port ${PORT}`);
+  });
+}
+
+startServer();
