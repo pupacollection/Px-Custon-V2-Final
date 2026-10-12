@@ -1,0 +1,512 @@
+/**
+ * PX CUSTOM — SUÍTE DE TESTES UNITÁRIOS DE HANDSHAKE E BLOQUEIO DE PRODUÇÃO (ETAPA 6.43)
+ * Arquivo: scripts/test-concurrency-handshake-unit.ts
+ *
+ * ESCOPO:
+ * Validar estaticamente e de forma 100% isolada a lógica de segurança do script
+ * de concorrência (scripts/test-checkin-concurrency-staging-v6-30.ts):
+ * 1. Validação robusta de URL de destino (userinfo, protocolos, caminhos, queries, portas).
+ * 2. Handshake obrigatório preliminar via GET /api/health/staging.
+ * 3. Falha fechada em qualquer anomalia de health check (401, 404, 500, JSON inválido, rede, timeout).
+ * 4. Verificação estrita de environment e projectRef.
+ * 5. Garantia de ZERO chamadas POST para check-in em todos os cenários de falha de handshake.
+ * 6. Garantia de que tokens de operadores NÃO são enviados para o health check.
+ *
+ * GARANTIAS:
+ * - Zero conexões de rede (sem chamadas a Supabase, Hostinger, Mercado Pago ou APIs).
+ * - Mocks puros em memória para fetch.
+ * - Zero execução de SQL em banco real.
+ */
+
+import assert from 'node:assert/strict';
+
+// Garantir que scripts não iniciem execuções CLI durante a importação
+process.env.NODE_ENV = 'test';
+
+import {
+  validateTargetUrl,
+  validateEnvironmentBarriers,
+  performStagingHandshake,
+  runConcurrencyTest,
+  FORBIDDEN_PRODUCTION_HOSTS,
+} from './test-checkin-concurrency-staging-v6-30';
+
+let totalTests = 0;
+let passedTests = 0;
+
+async function runTestCase(name: string, fn: () => Promise<void> | void) {
+  totalTests++;
+  try {
+    await fn();
+    passedTests++;
+    console.log(`  ✓ [PASS] ${name}`);
+  } catch (err: any) {
+    console.error(`  ✗ [FAIL] ${name}`);
+    console.error(`    Erro: ${err.message || err}`);
+    throw err;
+  }
+}
+
+async function runAllTests() {
+  console.log('=============================================================================');
+  console.log('PX CUSTOM — SUÍTE DE TESTES UNITÁRIOS DE HANDSHAKE E SEGURANÇA (ETAPA 6.43)');
+  console.log('=============================================================================');
+  console.log('Executando asserções puras em memória com mocks (sem rede, sem Supabase)...\n');
+
+  // ===========================================================================
+  // 1. FORTALECIMENTO DA VALIDAÇÃO DA URL DE DESTINO (TAREFA 2)
+  // ===========================================================================
+  console.log('1. Validação Fortalecida de URL de Destino:');
+
+  await runTestCase('1.1 Deve rejeitar URL vazia ou nula', () => {
+    assert.throws(() => validateTargetUrl(''), /URL DE HOMOLOGAÇÃO NÃO INFORMADA|URL DE HOMOLOGAÇÃO VAZIA/);
+    assert.throws(() => validateTargetUrl('   '), /URL DE HOMOLOGAÇÃO VAZIA/);
+  });
+
+  await runTestCase('1.2 Deve rejeitar URLs com credenciais embutidas (username/password)', () => {
+    assert.throws(
+      () => validateTargetUrl('https://admin:secret123@staging.pxcustom.com'),
+      /CREDENCIAIS NA URL/
+    );
+    assert.throws(
+      () => validateTargetUrl('http://operator@localhost:3001'),
+      /CREDENCIAIS NA URL/
+    );
+  });
+
+  await runTestCase('1.3 Deve rejeitar URLs com subpastas ou caminhos não autorizados', () => {
+    assert.throws(
+      () => validateTargetUrl('http://localhost:3001/api/checkin/validate'),
+      /CAMINHO NÃO AUTORIZADO/
+    );
+    assert.throws(
+      () => validateTargetUrl('https://staging-app.example.com/subpasta'),
+      /CAMINHO NÃO AUTORIZADO/
+    );
+  });
+
+  await runTestCase('1.4 Deve rejeitar URLs com query strings ou fragmentos', () => {
+    assert.throws(
+      () => validateTargetUrl('http://localhost:3001?env=staging'),
+      /PARÂMETROS NÃO AUTORIZADOS/
+    );
+    assert.throws(
+      () => validateTargetUrl('http://localhost:3001#anchor'),
+      /PARÂMETROS NÃO AUTORIZADOS/
+    );
+  });
+
+  await runTestCase('1.5 Deve exigir HTTPS para destinos remotos e rejeitar HTTP inseguro', () => {
+    assert.throws(
+      () => validateTargetUrl('http://remote-staging.pxcustom.com'),
+      /PROTOCOLO INSEGURO/
+    );
+  });
+
+  await runTestCase('1.6 Deve aceitar HTTP ou HTTPS para destinos locais (localhost, 127.0.0.1, ::1)', () => {
+    assert.equal(validateTargetUrl('http://localhost:3001'), 'http://localhost:3001');
+    assert.equal(validateTargetUrl('https://localhost:3001'), 'https://localhost:3001');
+    assert.equal(validateTargetUrl('http://127.0.0.1:3001'), 'http://127.0.0.1:3001');
+    assert.equal(validateTargetUrl('http://[::1]:3001'), 'http://[::1]:3001');
+  });
+
+  await runTestCase('1.7 Deve rejeitar portas inválidas (não inteiras ou fora de 1-65535)', () => {
+    assert.throws(() => validateTargetUrl('http://localhost:99999'), /PORTA INVÁLIDA|URL INVÁLIDA/);
+    assert.throws(() => validateTargetUrl('http://localhost:0'), /PORTA INVÁLIDA|URL INVÁLIDA/);
+    assert.throws(() => validateTargetUrl('http://localhost:port'), /PORTA INVÁLIDA|URL INVÁLIDA/);
+  });
+
+  await runTestCase('1.8 Deve rejeitar incondicionalmente todos os hostnames da blacklist de produção', () => {
+    for (const prodHost of FORBIDDEN_PRODUCTION_HOSTS) {
+      assert.throws(
+        () => validateTargetUrl(`https://${prodHost}`),
+        /DESTINO DE PRODUÇÃO RECUSADO/,
+        `Falha: Host de produção "${prodHost}" não foi bloqueado!`
+      );
+    }
+  });
+
+  await runTestCase('1.9 Deve normalizar e aceitar URL válida de staging', () => {
+    const validUrl = 'https://px-staging-backend.example.com/';
+    assert.equal(validateTargetUrl(validUrl), 'https://px-staging-backend.example.com');
+  });
+
+  // ===========================================================================
+  // 2. HANDSHAKE OBRIGATÓRIO (TAREFAS 1 E 3)
+  // ===========================================================================
+  console.log('\n2. Handshake Mandatório via GET /api/health/staging:');
+
+  const EXPECTED_PROJECT_REF = 'pxstagingprojectref123';
+
+  await runTestCase('2.1 Deve aprovar handshake com backend saudável, environment=staging e projectRef idêntico', async () => {
+    let calledUrl = '';
+    let calledHeaders: Record<string, string> = {};
+
+    const mockFetch: typeof fetch = async (input, init) => {
+      calledUrl = String(input);
+      calledHeaders = (init?.headers as Record<string, string>) || {};
+      return new Response(
+        JSON.stringify({
+          status: 'ONLINE',
+          environment: 'staging',
+          projectRef: EXPECTED_PROJECT_REF,
+          port: 3001,
+          supabaseConfigured: true,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    };
+
+    const result = await performStagingHandshake('http://localhost:3001', EXPECTED_PROJECT_REF, {
+      fetchFn: mockFetch,
+    });
+
+    assert.equal(calledUrl, 'http://localhost:3001/api/health/staging');
+    assert.equal(calledHeaders.Authorization, undefined, 'SEGURANÇA: Nenhum token deve ser enviado no health check');
+    assert.equal(result.environment, 'staging');
+    assert.equal(result.projectRef, EXPECTED_PROJECT_REF);
+    assert.equal(result.supabaseConfigured, true);
+  });
+
+  await runTestCase('2.2 Deve rejeitar quando o backend responde com projectRef divergente do esperado', async () => {
+    const mockFetch: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          status: 'ONLINE',
+          environment: 'staging',
+          projectRef: 'outro-projeto-diferente-456',
+          port: 3001,
+          supabaseConfigured: true,
+        }),
+        { status: 200 }
+      );
+    };
+
+    await assert.rejects(
+      async () => performStagingHandshake('http://localhost:3001', EXPECTED_PROJECT_REF, { fetchFn: mockFetch }),
+      /PROJETO SUPABASE DIVERGENTE/
+    );
+  });
+
+  await runTestCase('2.3 Deve rejeitar quando environment não for "staging" (ex.: "production" ou "dev")', async () => {
+    const mockFetch: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          status: 'ONLINE',
+          environment: 'production',
+          projectRef: EXPECTED_PROJECT_REF,
+          port: 3000,
+          supabaseConfigured: true,
+        }),
+        { status: 200 }
+      );
+    };
+
+    await assert.rejects(
+      async () => performStagingHandshake('http://localhost:3001', EXPECTED_PROJECT_REF, { fetchFn: mockFetch }),
+      /AMBIENTE DIVERGENTE/
+    );
+  });
+
+  await runTestCase('2.4 Deve rejeitar quando backend responde com HTTP 401, 404 ou 500', async () => {
+    for (const code of [401, 404, 500]) {
+      const mockFetch: typeof fetch = async () => new Response('Error', { status: code });
+      await assert.rejects(
+        async () => performStagingHandshake('http://localhost:3001', EXPECTED_PROJECT_REF, { fetchFn: mockFetch }),
+        /RESPOSTA ANÔMALA DO HEALTH CHECK/
+      );
+    }
+  });
+
+  await runTestCase('2.5 Deve rejeitar quando backend responde com JSON inválido / HTML', async () => {
+    const mockFetch: typeof fetch = async () =>
+      new Response('<html><body>502 Bad Gateway</body></html>', {
+        status: 200,
+        headers: { 'Content-Type': 'text/html' },
+      });
+
+    await assert.rejects(
+      async () => performStagingHandshake('http://localhost:3001', EXPECTED_PROJECT_REF, { fetchFn: mockFetch }),
+      /JSON INVÁLIDO NO HEALTH CHECK/
+    );
+  });
+
+  await runTestCase('2.6 Deve rejeitar em caso de erro de rede (Connection Refused)', async () => {
+    const mockFetch: typeof fetch = async () => {
+      throw new Error('fetch failed: ECONNREFUSED 127.0.0.1:3001');
+    };
+
+    await assert.rejects(
+      async () => performStagingHandshake('http://localhost:3001', EXPECTED_PROJECT_REF, { fetchFn: mockFetch }),
+      /FALHA DE REDE NO HANDSHAKE/
+    );
+  });
+
+  await runTestCase('2.7 Deve rejeitar em caso de timeout expirado', async () => {
+    const mockFetch: typeof fetch = async (_url, init) => {
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          const err = new Error('The operation was aborted');
+          err.name = 'AbortError';
+          reject(err);
+        });
+      });
+    };
+
+    await assert.rejects(
+      async () =>
+        performStagingHandshake('http://localhost:3001', EXPECTED_PROJECT_REF, {
+          fetchFn: mockFetch,
+          timeoutMs: 50,
+        }),
+      /TIMEOUT NO HANDSHAKE/
+    );
+  });
+
+  await runTestCase('2.8 Deve falhar imediatamente se STAGING_PROJECT_REF não for fornecido', async () => {
+    await assert.rejects(
+      async () => performStagingHandshake('http://localhost:3001', ''),
+      /STAGING_PROJECT_REF NÃO INFORMADO/
+    );
+  });
+
+  await runTestCase('2.9 Deve rejeitar se o backend responder sem o campo projectRef', async () => {
+    const mockFetch: typeof fetch = async () => {
+      return new Response(
+        JSON.stringify({
+          status: 'ONLINE',
+          environment: 'staging',
+          supabaseConfigured: true,
+        }),
+        { status: 200 }
+      );
+    };
+
+    await assert.rejects(
+      async () => performStagingHandshake('http://localhost:3001', EXPECTED_PROJECT_REF, { fetchFn: mockFetch }),
+      /RESPOSTA SEM projectRef/
+    );
+  });
+
+  // ===========================================================================
+  // 3. FALHA FECHADA: ZERO POSTS DE CHECK-IN QUANDO HANDSHAKE FALHA (TAREFA 4)
+  // ===========================================================================
+  console.log('\n3. Garantia de Falha Fechada (Contagem de POSTs Estritamente Zero):');
+
+  const failureScenarios = [
+    {
+      name: 'Handshake com projectRef divergente',
+      healthResponse: { status: 200, body: JSON.stringify({ environment: 'staging', projectRef: 'divergente-123', supabaseConfigured: true }) },
+    },
+    {
+      name: 'Handshake com environment="production"',
+      healthResponse: { status: 200, body: JSON.stringify({ environment: 'production', projectRef: EXPECTED_PROJECT_REF, supabaseConfigured: true }) },
+    },
+    {
+      name: 'Handshake retornando HTTP 500',
+      healthResponse: { status: 500, body: 'Internal Server Error' },
+    },
+    {
+      name: 'Handshake retornando HTTP 404',
+      healthResponse: { status: 404, body: 'Not Found' },
+    },
+    {
+      name: 'Handshake com JSON malformado',
+      healthResponse: { status: 200, body: 'INVALID_JSON_CONTENT' },
+    },
+    {
+      name: 'Handshake sem projectRef no corpo',
+      healthResponse: { status: 200, body: JSON.stringify({ environment: 'staging', supabaseConfigured: true }) },
+    },
+  ];
+
+  for (const [idx, scenario] of failureScenarios.entries()) {
+    await runTestCase(`3.${idx + 1} Cenário [${scenario.name}] DEVE abortar com ZERO POSTs enviados`, async () => {
+      let postCount = 0;
+      let getCount = 0;
+
+      const mockFetch: typeof fetch = async (input, init) => {
+        const method = (init?.method || 'GET').toUpperCase();
+        const urlStr = String(input);
+
+        if (urlStr.includes('/api/health/staging')) {
+          getCount++;
+          return new Response(scenario.healthResponse.body, { status: scenario.healthResponse.status });
+        }
+
+        if (method === 'POST') {
+          postCount++;
+          return new Response(JSON.stringify({ authorized: false }), { status: 200 });
+        }
+
+        return new Response('Not Implemented', { status: 501 });
+      };
+
+      await assert.rejects(
+        async () =>
+          runConcurrencyTest({
+            backendUrl: 'http://localhost:3001',
+            stagingProjectRef: EXPECTED_PROJECT_REF,
+            targetAck: 'true',
+            operatorToken1: 'token-operador-1',
+            operatorToken2: 'token-operador-2',
+            fetchFn: mockFetch,
+          }),
+        /BLOQUEIO DE SEGURANÇA/
+      );
+
+      // Asserção crítica de segurança: nenhum POST foi disparado!
+      assert.equal(
+        postCount,
+        0,
+        `VULNERABILIDADE CRÍTICA: ${postCount} requisições POST de check-in foram enviadas mesmo com falha no handshake!`
+      );
+      assert.equal(getCount, 1, 'Esperada exatamente 1 chamada preliminar de health check');
+    });
+  }
+
+  await runTestCase('3.7 Confirmação manual (STAGING_TARGET_ACK=true) NÃO pode liberar execução se o handshake falhar', async () => {
+    let postCount = 0;
+
+    const mockFetch: typeof fetch = async (input, init) => {
+      if (String(input).includes('/api/health/staging')) {
+        // Backend responde com projeto diferente
+        return new Response(
+          JSON.stringify({
+            environment: 'staging',
+            projectRef: 'projeto-estranho',
+            supabaseConfigured: true,
+          }),
+          { status: 200 }
+        );
+      }
+      if ((init?.method || 'GET').toUpperCase() === 'POST') {
+        postCount++;
+      }
+      return new Response('{}', { status: 200 });
+    };
+
+    await assert.rejects(
+      async () =>
+        runConcurrencyTest({
+          backendUrl: 'http://localhost:3001',
+          stagingProjectRef: EXPECTED_PROJECT_REF,
+          targetAck: 'true', // Usuário tentou forçar com ACK="true"
+          operatorToken1: 'token-1',
+          operatorToken2: 'token-2',
+          fetchFn: mockFetch,
+        }),
+      /PROJETO SUPABASE DIVERGENTE/
+    );
+
+    assert.equal(postCount, 0, 'STAGING_TARGET_ACK não pode contornar a divergência de projeto!');
+  });
+
+  // ===========================================================================
+  // 4. FLUXO COMPLETO VÁLIDO E AUDITORIA DE TOKENS (TAREFA 4)
+  // ===========================================================================
+  console.log('\n4. Fluxo Completo Válido e Integridade de Tokens:');
+
+  await runTestCase('4.1 Fluxo completo com handshake aprovado dispara exatamente 2 POSTs e consulta auditoria', async () => {
+    let healthCalls = 0;
+    let postCalls = 0;
+    let checkinGetCalls = 0;
+    const postHeaders: Record<string, string>[] = [];
+    let healthHeaderAuth: string | undefined = undefined;
+
+    const mockFetch: typeof fetch = async (input, init) => {
+      const urlStr = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+
+      if (urlStr.includes('/api/health/staging')) {
+        healthCalls++;
+        healthHeaderAuth = (init?.headers as Record<string, string>)?.Authorization;
+        return new Response(
+          JSON.stringify({
+            status: 'ONLINE',
+            environment: 'staging',
+            projectRef: EXPECTED_PROJECT_REF,
+            port: 3001,
+            supabaseConfigured: true,
+          }),
+          { status: 200 }
+        );
+      }
+
+      if (urlStr.includes('/api/checkin/validate') && method === 'POST') {
+        postCalls++;
+        postHeaders.push((init?.headers as Record<string, string>) || {});
+
+        // Simula 1 sucesso e 1 recusa por reuso (comportamento atômico do PostgreSQL)
+        if (postCalls === 1) {
+          return new Response(
+            JSON.stringify({
+              authorized: true,
+              reason: 'CHECK-IN AUTORIZADO',
+              ticket: { id: 'tkt-uuid-valid-1', ticket_code: 'PX-STAGING-CONCURRENT-001', status: 'USED' },
+            }),
+            { status: 200 }
+          );
+        } else {
+          return new Response(
+            JSON.stringify({
+              authorized: false,
+              reason: 'INGRESSO JÁ UTILIZADO',
+            }),
+            { status: 200 }
+          );
+        }
+      }
+
+      if (urlStr.includes('/api/checkins') && method === 'GET') {
+        checkinGetCalls++;
+        return new Response(
+          JSON.stringify([
+            {
+              id: 'chk-001',
+              ticket_id: 'tkt-uuid-valid-1',
+              event_id: 'evt-001',
+              checked_by: 'op-001',
+              checked_at: new Date().toISOString(),
+              device_info: JSON.stringify({ ticket_code: 'PX-STAGING-CONCURRENT-001' }),
+              created_at: new Date().toISOString(),
+            },
+          ]),
+          { status: 200 }
+        );
+      }
+
+      return new Response('Not Found', { status: 404 });
+    };
+
+    const result = await runConcurrencyTest({
+      backendUrl: 'http://localhost:3001',
+      stagingProjectRef: EXPECTED_PROJECT_REF,
+      targetAck: 'true',
+      operatorToken1: 'jwt-op-token-1',
+      operatorToken2: 'jwt-op-token-2',
+      fetchFn: mockFetch,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(healthCalls, 1, 'Exatamente 1 chamada de health check');
+    assert.equal(healthHeaderAuth, undefined, 'SEGURANÇA: Token NUNCA pode ser repassado ao health check');
+    assert.equal(postCalls, 2, 'Exatamente 2 chamadas concorrentes enviadas');
+    assert.equal(checkinGetCalls, 1, 'Exatamente 1 consulta de auditoria realizada');
+
+    // Validação de que os tokens foram enviados exclusivamente aos endpoints de portaria
+    assert.equal(postHeaders[0]['Authorization'], 'Bearer jwt-op-token-1');
+    assert.equal(postHeaders[1]['Authorization'], 'Bearer jwt-op-token-2');
+  });
+
+  console.log('\n=============================================================================');
+  console.log(`SUCESSO TOTAL: ${passedTests} de ${totalTests} testes unitários APROVADOS!`);
+  console.log('Todas as barreiras de URL, handshake mandatório e bloqueio foram comprovadas.');
+  console.log('=============================================================================');
+}
+
+runAllTests().catch((err) => {
+  console.error('\n[FALHA NA SUÍTE DE TESTES UNITÁRIOS DE HANDSHAKE]');
+  console.error(err.message || err);
+  process.exit(1);
+});

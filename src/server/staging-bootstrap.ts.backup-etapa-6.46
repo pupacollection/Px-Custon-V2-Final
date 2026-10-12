@@ -1,0 +1,272 @@
+/**
+ * PX CUSTOM — MÓDULO DE VALIDAÇÃO ESTREITA DE AMBIENTE DE HOMOLOGAÇÃO (ETAPA 6.33)
+ * Arquivo: src/server/staging-bootstrap.ts
+ *
+ * ESCOPO:
+ * Validar rigorosamente as variáveis de ambiente antes da inicialização do backend de teste,
+ * garantindo que ele NUNCA conecte ao Supabase de produção nem aceite escrita em projetos não autorizados.
+ *
+ * GARANTIAS:
+ * 1. Separação pura da validação (testável sem rede/clientes) da instanciação do cliente Supabase.
+ * 2. Carregamento exclusivo de .env.staging via caminho absoluto (NUNCA recorre a .env de produção).
+ * 3. Exige PX_ENV=staging e valida STAGING_PROJECT_REF canônico (15-40 alfanumérico).
+ * 4. Valida se SUPABASE_URL aponta exatamente para https://<STAGING_PROJECT_REF>.supabase.co sem portas, credenciais, subpastas ou query.
+ * 5. Rejeição explícita de placeholders (<...>, insira).
+ * 6. Zero vazamento de chaves secretas ou tokens em logs.
+ */
+
+import path from 'path';
+import fs from 'fs';
+import dotenv from 'dotenv';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+
+export interface StagingValidatedConfig {
+  projectRef: string;
+  supabaseUrl: string;
+  serviceRoleKey: string;
+  port: number;
+}
+
+export interface StagingBootstrapResult extends StagingValidatedConfig {
+  supabaseAdmin: SupabaseClient;
+}
+
+/**
+ * Carrega estritamente o arquivo .env.staging via caminho absoluto.
+ * NUNCA executa dotenv.config() sem caminho (elimina qualquer fallback para .env de produção).
+ */
+export function loadStagingEnvironment(options?: { customPath?: string; requireFile?: boolean }): void {
+  const stagingEnvPath = options?.customPath
+    ? path.resolve(options.customPath)
+    : path.resolve(process.cwd(), '.env.staging');
+
+  if (fs.existsSync(stagingEnvPath)) {
+    dotenv.config({ path: stagingEnvPath, override: true });
+    return;
+  }
+
+  // Se o arquivo não existir
+  const hasEnvInProcess = process.env.PX_ENV === 'staging';
+  if (options?.requireFile || !hasEnvInProcess) {
+    console.error('\n=============================================================================');
+    console.error('[BLOQUEIO DE SEGURANÇA: ARQUIVO .ENV.STAGING AUSENTE]');
+    console.error('=============================================================================');
+    console.error(`O arquivo obrigatório ".env.staging" não foi encontrado no caminho esperado:`);
+    console.error(`  ${stagingEnvPath}`);
+    console.error('\nPara executar o ambiente de homologação, crie o arquivo ".env.staging" ou');
+    console.error('forneça as variáveis mandatárias diretamente via ambiente do processo (PX_ENV=staging).');
+    console.error('O carregamento de variáveis do arquivo ".env" de produção está ESTRITAMENTE DESATIVADO.');
+    console.error('=============================================================================\n');
+    throw new Error(`[BLOQUEIO DE SEGURANÇA: ARQUIVO .ENV.STAGING AUSENTE] Arquivo .env.staging ausente em: ${stagingEnvPath}`);
+  }
+}
+
+/**
+ * Validador puro de configuração de homologação (Sem efeitos colaterais, sem conexões de rede e sem process.exit).
+ * Ideal para execução segura em testes unitários automatizados.
+ */
+export function validateStagingConfig(env: Record<string, string | undefined>): StagingValidatedConfig {
+  // 1. Exigência estrita de modo de homologação
+  const rawPxEnv = env.PX_ENV || '';
+  const pxEnv = rawPxEnv.trim();
+  if (pxEnv !== 'staging') {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: AMBIENTE NÃO AUTORIZADO] PX_ENV deve ser estritamente "staging". Recebido: "${rawPxEnv || '<não definido>'}"`
+    );
+  }
+
+  // 2. Exigência do Project Reference de staging fornecido pelo operador e validação de formato
+  const rawProjectRef = env.STAGING_PROJECT_REF || '';
+  const projectRef = rawProjectRef.trim().toLowerCase();
+  if (!projectRef) {
+    throw new Error(
+      '[BLOQUEIO DE SEGURANÇA: STAGING_PROJECT_REF NÃO INFORMADO] O Project Reference do projeto de staging é obrigatório.'
+    );
+  }
+
+  // Detecção de placeholder não preenchido no Project Reference
+  if (projectRef.includes('<') || projectRef.includes('>') || projectRef.includes('insira')) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: STAGING_PROJECT_REF CONTÉM PLACEHOLDER] O valor contém marcadores de template: "${rawProjectRef}"`
+    );
+  }
+
+  // Validação estrita de formato do Project Reference (Supabase Cloud: 15 a 40 caracteres alfanuméricos)
+  const projectRefRegex = /^[a-z0-9]{15,40}$/;
+  if (!projectRefRegex.test(projectRef)) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: FORMATO DE STAGING_PROJECT_REF INVÁLIDO] Formato alfanumérico esperado (15-40 chars minúsculos). Recebido: "${rawProjectRef}"`
+    );
+  }
+
+  // 3. Exigência estrita de SUPABASE_URL (SEM fallback para VITE_SUPABASE_URL)
+  const rawSupabaseUrl = env.SUPABASE_URL || '';
+  const supabaseUrl = rawSupabaseUrl.trim();
+  if (!supabaseUrl) {
+    throw new Error(
+      '[BLOQUEIO DE SEGURANÇA: SUPABASE_URL NÃO DEFINIDA] A variável SUPABASE_URL é mandatória no modo staging.'
+    );
+  }
+
+  // Detecção de placeholder não preenchido na URL
+  if (supabaseUrl.includes('<') || supabaseUrl.includes('>') || supabaseUrl.includes('insira')) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: SUPABASE_URL CONTÉM PLACEHOLDER] A URL contém marcadores de template: "${rawSupabaseUrl}"`
+    );
+  }
+
+  // 4. Validação sintática, de protocolo, credenciais embutidas, portas e subpastas
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(supabaseUrl);
+  } catch {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: URL INVÁLIDA] Formato de SUPABASE_URL sintaticamente inválido: "${rawSupabaseUrl}"`
+    );
+  }
+
+  // Validação do protocolo HTTPS
+  if (parsedUrl.protocol !== 'https:') {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: PROTOCOLO INSEGURO] SUPABASE_URL deve utilizar estritamente o protocolo HTTPS. Recebido: "${parsedUrl.protocol}"`
+    );
+  }
+
+  // Validação de credenciais embutidas na URL (ex: https://user:pass@host)
+  if (parsedUrl.username || parsedUrl.password) {
+    throw new Error(
+      '[BLOQUEIO DE SEGURANÇA: CREDENCIAIS EMBUTIDAS NA URL] SUPABASE_URL não pode conter usuário ou senha embutidos.'
+    );
+  }
+
+  // Validação de porta (não permitir portas customizadas)
+  if (parsedUrl.port) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: PORTA NÃO AUTORIZADA] SUPABASE_URL não pode conter porta personalizada: "${parsedUrl.port}"`
+    );
+  }
+
+  // Validação de caminho/subpastas
+  if (parsedUrl.pathname !== '' && parsedUrl.pathname !== '/') {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: CAMINHO NÃO AUTORIZADO] SUPABASE_URL não pode conter subpastas ou caminhos adicionais: "${parsedUrl.pathname}"`
+    );
+  }
+
+  // Validação de query strings e fragmentos
+  if (parsedUrl.search || parsedUrl.hash) {
+    throw new Error(
+      '[BLOQUEIO DE SEGURANÇA: PARÂMETROS NÃO AUTORIZADOS] SUPABASE_URL não pode conter query string ou fragmentos (#).'
+    );
+  }
+
+  const expectedHostname = `${projectRef}.supabase.co`;
+  const actualHostname = parsedUrl.hostname.toLowerCase();
+
+  if (actualHostname !== expectedHostname) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: INCOMPATIBILIDADE DE PROJETO SUPABASE] O hostname configurado ("${actualHostname}") não corresponde ao STAGING_PROJECT_REF ("${expectedHostname}").`
+    );
+  }
+
+  // Validação de correspondência exata de URL normalizada
+  const expectedUrl = `https://${expectedHostname}`;
+  const normalizedActualUrl = supabaseUrl.replace(/\/+$/, '');
+  if (normalizedActualUrl !== expectedUrl) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: DISCREPÂNCIA DE URL] A URL configurada ("${normalizedActualUrl}") não corresponde exatamente ao formato canônico ("${expectedUrl}").`
+    );
+  }
+
+  // 5. Exigência de Service Role Key exclusiva
+  const rawServiceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY || '';
+  const serviceRoleKey = rawServiceRoleKey.trim();
+  if (!serviceRoleKey) {
+    throw new Error(
+      '[BLOQUEIO DE SEGURANÇA: SUPABASE_SERVICE_ROLE_KEY NÃO DETECTADA] A chave service_role do projeto de staging é necessária.'
+    );
+  }
+
+  if (serviceRoleKey.includes('<') || serviceRoleKey.includes('>') || serviceRoleKey.includes('insira')) {
+    throw new Error(
+      '[BLOQUEIO DE SEGURANÇA: SUPABASE_SERVICE_ROLE_KEY CONTÉM PLACEHOLDER] A chave service_role contém marcadores de template.'
+    );
+  }
+
+  // 6. Validação e seleção da porta de homologação (prioriza STAGING_PORT, fallback PORT, padrão 3001)
+  const rawPort = env.STAGING_PORT || env.PORT;
+  let port = 3001;
+
+  if (rawPort !== undefined && rawPort.trim() !== '') {
+    const trimmedPort = rawPort.trim();
+    if (trimmedPort.includes('<') || trimmedPort.includes('>') || trimmedPort.includes('insira')) {
+      throw new Error(
+        `[BLOQUEIO DE SEGURANÇA: PORTA DE STAGING CONTÉM PLACEHOLDER] A porta de homologação contém marcadores de template: "${rawPort}"`
+      );
+    }
+    const parsedPort = Number(trimmedPort);
+    if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+      throw new Error(
+        `[BLOQUEIO DE SEGURANÇA: PORTA DE STAGING INVÁLIDA] A porta deve ser um número inteiro válido entre 1 e 65535. Recebido: "${rawPort}"`
+      );
+    }
+    port = parsedPort;
+  }
+
+  return {
+    projectRef,
+    supabaseUrl: expectedUrl,
+    serviceRoleKey,
+    port,
+  };
+}
+
+/**
+ * Instancia o cliente Supabase isolado para staging a partir de configurações validadas.
+ */
+export function createStagingClient(config: StagingValidatedConfig): SupabaseClient {
+  return createClient(config.supabaseUrl, config.serviceRoleKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+}
+
+/**
+ * Ponto de entrada de bootstrap para o servidor de homologação.
+ * Carrega .env.staging (sem fallback para .env), valida configuração e instancia o cliente.
+ * Aborta o processo imediatamente caso ocorra qualquer erro de validação.
+ */
+export function validateAndBootstrapStaging(options?: { requireFile?: boolean }): StagingBootstrapResult {
+  console.log('=============================================================================');
+  console.log('PX CUSTOM — INICIALIZAÇÃO CONTROLADA DO BACKEND DE HOMOLOGAÇÃO (STAGING)');
+  console.log('=============================================================================');
+
+  try {
+    loadStagingEnvironment(options);
+  } catch (err: any) {
+    process.exit(1);
+  }
+
+  let config: StagingValidatedConfig;
+  try {
+    config = validateStagingConfig(process.env);
+  } catch (err: any) {
+    console.error('\n' + err.message + '\n');
+    process.exit(1);
+  }
+
+  const supabaseAdmin = createStagingClient(config);
+
+  console.log(`[STAGING BOOTSTRAP] Projeto Supabase Staging Validado: ${config.projectRef}`);
+  console.log(`[STAGING BOOTSTRAP] Endpoint Supabase Conectado: ${config.supabaseUrl}`);
+  console.log(`[STAGING BOOTSTRAP] Porta do Servidor Staging: ${config.port}`);
+  console.log('[STAGING BOOTSTRAP] Credenciais service_role verificadas (segredos não expostos).');
+  console.log('[STAGING BOOTSTRAP] Ambiente autorizado para processamento de homologação.');
+
+  return {
+    ...config,
+    supabaseAdmin,
+  };
+}

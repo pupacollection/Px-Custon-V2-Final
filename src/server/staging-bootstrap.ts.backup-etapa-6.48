@@ -1,0 +1,386 @@
+/**
+ * PX CUSTOM — MÓDULO DE VALIDAÇÃO ESTREITA DE AMBIENTE DE HOMOLOGAÇÃO (ETAPA 6.46)
+ * Arquivo: src/server/staging-bootstrap.ts
+ *
+ * ESCOPO:
+ * Validar rigorosamente as variáveis de ambiente antes da inicialização do backend de staging,
+ * garantindo isolamento total e impedindo qualquer conexão ao Supabase de produção.
+ *
+ * GARANTIAS (ETAPA 6.46):
+ * 1. Separação pura de variáveis: STAGING_SUPABASE_URL, STAGING_SUPABASE_SERVICE_ROLE_KEY e STAGING_PROJECT_REF.
+ * 2. Bloqueio ativo de fallbacks para variáveis de produção (SUPABASE_URL, VITE_SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY).
+ * 3. Barreira independente de proteção contra colisão com projeto de produção.
+ * 4. Carregamento exclusivo de .env.staging via caminho absoluto com override.
+ * 5. Validação estrita de formato canônico https://<STAGING_PROJECT_REF>.supabase.co.
+ * 6. Zero vazamento de segredos em logs e exceções.
+ */
+
+import path from 'path';
+import fs from 'fs';
+import dotenv from 'dotenv';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+
+export interface StagingValidatedConfig {
+  projectRef: string;
+  supabaseUrl: string;
+  serviceRoleKey: string;
+  port: number;
+}
+
+export interface StagingBootstrapResult extends StagingValidatedConfig {
+  supabaseAdmin: SupabaseClient;
+}
+
+export interface StagingValidationOptions {
+  customPath?: string;
+  requireFile?: boolean;
+  independentProductionProjectRef?: string;
+  allowWithoutIndependentProductionCheck?: boolean;
+}
+
+// Referências de projeto conhecidas / reservadas de produção
+export const FORBIDDEN_PRODUCTION_PROJECT_REFS = new Set([
+  'your-project',
+  'production',
+  'prod',
+  'pxcustom-prod',
+]);
+
+/**
+ * Resolve de forma estritamente independente a identidade do projeto de produção.
+ * A referência NÃO pode ser considerada confiável se vier da mesma configuração do staging.
+ * Fontes avaliadas:
+ * 1. Injeção direta de barreira independente via options.independentProductionProjectRef.
+ * 2. Variável de processo externa process.env.PRODUCTION_PROJECT_REF.
+ * 3. Leitura e parsing isolado do arquivo .env de produção no disco (se existir).
+ */
+export function resolveIndependentProductionRef(options?: StagingValidationOptions): {
+  ref: string | null;
+  source: string;
+} {
+  // 1. Injeção direta de barreira independente (usada por orquestradores e testes)
+  if (options?.independentProductionProjectRef && options.independentProductionProjectRef.trim()) {
+    return {
+      ref: options.independentProductionProjectRef.trim().toLowerCase(),
+      source: 'options.independentProductionProjectRef',
+    };
+  }
+
+  // 2. Variável de ambiente do processo host (definida externamente, fora de .env.staging)
+  const processProdRef = process.env.PRODUCTION_PROJECT_REF;
+  if (processProdRef && processProdRef.trim()) {
+    return {
+      ref: processProdRef.trim().toLowerCase(),
+      source: 'process.env.PRODUCTION_PROJECT_REF',
+    };
+  }
+
+  // 3. Inspeção isolada do arquivo .env de produção no disco (sem poluir process.env)
+  try {
+    const prodEnvPath = path.resolve(process.cwd(), '.env');
+    if (fs.existsSync(prodEnvPath)) {
+      const prodContent = fs.readFileSync(prodEnvPath, 'utf-8');
+      const match = prodContent.match(/^\s*(?:SUPABASE_URL|VITE_SUPABASE_URL)\s*=\s*["']?https:\/\/([a-z0-9_-]+)\.supabase\.co/m);
+      if (match && match[1]) {
+        return {
+          ref: match[1].trim().toLowerCase(),
+          source: 'arquivo .env de produção (disco)',
+        };
+      }
+    }
+  } catch {
+    // Falha silenciosa de leitura de disco na resolução secundária
+  }
+
+  return { ref: null, source: 'none' };
+}
+
+/**
+ * Carrega estritamente o arquivo .env.staging via caminho absoluto.
+ * NUNCA executa dotenv.config() sem caminho (elimina qualquer fallback para .env de produção).
+ */
+export function loadStagingEnvironment(options?: { customPath?: string; requireFile?: boolean }): void {
+  const stagingEnvPath = options?.customPath
+    ? path.resolve(options.customPath)
+    : path.resolve(process.cwd(), '.env.staging');
+
+  if (fs.existsSync(stagingEnvPath)) {
+    dotenv.config({ path: stagingEnvPath, override: true });
+    return;
+  }
+
+  // Se o arquivo não existir
+  const hasEnvInProcess = process.env.PX_ENV === 'staging';
+  if (options?.requireFile || !hasEnvInProcess) {
+    console.error('\n=============================================================================');
+    console.error('[BLOQUEIO DE SEGURANÇA: ARQUIVO .ENV.STAGING AUSENTE]');
+    console.error('=============================================================================');
+    console.error(`O arquivo obrigatório ".env.staging" não foi encontrado no caminho esperado:`);
+    console.error(`  ${stagingEnvPath}`);
+    console.error('\nPara executar o ambiente de homologação, crie o arquivo ".env.staging" ou');
+    console.error('forneça as variáveis mandatárias diretamente via ambiente do processo (PX_ENV=staging).');
+    console.error('O carregamento de variáveis do arquivo ".env" de produção está ESTRITAMENTE DESATIVADO.');
+    console.error('=============================================================================\n');
+    throw new Error(`[BLOQUEIO DE SEGURANÇA: ARQUIVO .ENV.STAGING AUSENTE] Arquivo .env.staging ausente em: ${stagingEnvPath}`);
+  }
+}
+
+/**
+ * Validador puro de configuração de homologação (Sem efeitos colaterais, sem conexões de rede e sem process.exit).
+ * Ideal para execução segura em testes unitários automatizados.
+ */
+export function validateStagingConfig(
+  env: Record<string, string | undefined>,
+  options?: StagingValidationOptions
+): StagingValidatedConfig {
+  // 1. Exigência estrita de modo de homologação
+  const rawPxEnv = env.PX_ENV || '';
+  const pxEnv = rawPxEnv.trim();
+  if (pxEnv !== 'staging') {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: AMBIENTE NÃO AUTORIZADO] PX_ENV deve ser estritamente "staging". Recebido: "${rawPxEnv || '<não definido>'}"`
+    );
+  }
+
+  // 2. Exigência do Project Reference de staging fornecido pelo operador e validação de formato
+  const rawProjectRef = env.STAGING_PROJECT_REF || '';
+  const projectRef = rawProjectRef.trim().toLowerCase();
+  if (!projectRef) {
+    throw new Error(
+      '[BLOQUEIO DE SEGURANÇA: STAGING_PROJECT_REF NÃO INFORMADO] O Project Reference do projeto de staging é obrigatório.'
+    );
+  }
+
+  // Detecção de placeholder não preenchido no Project Reference
+  if (projectRef.includes('<') || projectRef.includes('>') || projectRef.includes('insira')) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: STAGING_PROJECT_REF CONTÉM PLACEHOLDER] O valor contém marcadores de template: "${rawProjectRef}"`
+    );
+  }
+
+  // Validação estrita de formato do Project Reference (Supabase Cloud: 15 a 40 caracteres alfanuméricos)
+  const projectRefRegex = /^[a-z0-9]{15,40}$/;
+  if (!projectRefRegex.test(projectRef)) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: FORMATO DE STAGING_PROJECT_REF INVÁLIDO] Formato alfanumérico esperado (15-40 chars minúsculos). Recebido: "${rawProjectRef}"`
+    );
+  }
+
+  // 3. Validação contra lista conhecida de referências de produção
+  if (FORBIDDEN_PRODUCTION_PROJECT_REFS.has(projectRef)) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: REFERÊNCIA DE PRODUÇÃO CONHECIDA] O valor informado para STAGING_PROJECT_REF ("${projectRef}") é uma referência de produção proibida.`
+    );
+  }
+
+  // 4. BARREIRA INDEPENDENTE: Verificação e proteção contra identidade de produção
+  if (!options?.allowWithoutIndependentProductionCheck) {
+    const independentProd = resolveIndependentProductionRef(options);
+
+    if (!independentProd.ref) {
+      throw new Error(
+        '[BLOQUEIO DE SEGURANÇA: IDENTIDADE DE PRODUÇÃO NÃO VERIFICÁVEL] ' +
+        'Não foi possível verificar a identidade do projeto de produção de forma independente. ' +
+        'Para garantir segregação estrita e impedir inicialização contra produção, ' +
+        'é pré-requisito obrigatório disponibilizar uma identidade de produção independente ' +
+        '(via PRODUCTION_PROJECT_REF no ambiente externo, via arquivo .env de produção ou via opções de barreira).'
+      );
+    }
+
+    if (projectRef === independentProd.ref) {
+      throw new Error(
+        `[BLOQUEIO DE SEGURANÇA: REFERÊNCIA DE PRODUÇÃO CONFIGURADA COMO STAGING] ` +
+        `O STAGING_PROJECT_REF ("${projectRef}") coincide com a identidade do projeto de produção verificada independentemente ` +
+        `(${independentProd.source}: "${independentProd.ref}"). ` +
+        `A inicialização de homologação contra o projeto de produção é expressamente proibida.`
+      );
+    }
+  }
+
+  // 5. Exigência estrita de STAGING_SUPABASE_URL (SEM fallback silencioso para SUPABASE_URL ou VITE_SUPABASE_URL)
+  const rawStagingUrl = env.STAGING_SUPABASE_URL || '';
+  const stagingUrl = rawStagingUrl.trim();
+
+  if (!stagingUrl) {
+    if (env.SUPABASE_URL || env.VITE_SUPABASE_URL) {
+      throw new Error(
+        '[BLOQUEIO DE SEGURANÇA: FALLBACK DE PRODUÇÃO PROIBIDO] ' +
+        'Tentativa de utilizar SUPABASE_URL ou VITE_SUPABASE_URL no ambiente de homologação. ' +
+        'O bootstrap exige estritamente a variável STAGING_SUPABASE_URL e não aceita variáveis de produção como fallback.'
+      );
+    }
+    throw new Error(
+      '[BLOQUEIO DE SEGURANÇA: STAGING_SUPABASE_URL NÃO DEFINIDA] A variável STAGING_SUPABASE_URL é mandatória no modo staging.'
+    );
+  }
+
+  // Detecção de placeholder não preenchido na URL
+  if (stagingUrl.includes('<') || stagingUrl.includes('>') || stagingUrl.includes('insira')) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: STAGING_SUPABASE_URL CONTÉM PLACEHOLDER] A URL contém marcadores de template: "${rawStagingUrl}"`
+    );
+  }
+
+  // 6. Validação sintática, de protocolo, credenciais embutidas, portas e subpastas
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(stagingUrl);
+  } catch {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: URL INVÁLIDA] Formato de STAGING_SUPABASE_URL sintaticamente inválido: "${rawStagingUrl}"`
+    );
+  }
+
+  // Validação do protocolo HTTPS
+  if (parsedUrl.protocol !== 'https:') {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: PROTOCOLO INSEGURO] STAGING_SUPABASE_URL deve utilizar estritamente o protocolo HTTPS. Recebido: "${parsedUrl.protocol}"`
+    );
+  }
+
+  // Validação de credenciais embutidas na URL (ex: https://user:pass@host)
+  if (parsedUrl.username || parsedUrl.password) {
+    throw new Error(
+      '[BLOQUEIO DE SEGURANÇA: CREDENCIAIS EMBUTIDAS NA URL] STAGING_SUPABASE_URL não pode conter usuário ou senha embutidos.'
+    );
+  }
+
+  // Validação de porta (não permitir portas customizadas)
+  if (parsedUrl.port) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: PORTA NÃO AUTORIZADA] STAGING_SUPABASE_URL não pode conter porta personalizada: "${parsedUrl.port}"`
+    );
+  }
+
+  // Validação de caminho/subpastas
+  if (parsedUrl.pathname !== '' && parsedUrl.pathname !== '/') {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: CAMINHO NÃO AUTORIZADO] STAGING_SUPABASE_URL não pode conter subpastas ou caminhos adicionais: "${parsedUrl.pathname}"`
+    );
+  }
+
+  // Validação de query strings e fragmentos
+  if (parsedUrl.search || parsedUrl.hash) {
+    throw new Error(
+      '[BLOQUEIO DE SEGURANÇA: PARÂMETROS NÃO AUTORIZADOS] STAGING_SUPABASE_URL não pode conter query string ou fragmentos (#).'
+    );
+  }
+
+  const expectedHostname = `${projectRef}.supabase.co`;
+  const actualHostname = parsedUrl.hostname.toLowerCase();
+
+  if (actualHostname !== expectedHostname) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: INCOMPATIBILIDADE DE PROJETO SUPABASE] O hostname configurado ("${actualHostname}") não corresponde ao STAGING_PROJECT_REF ("${expectedHostname}").`
+    );
+  }
+
+  // Validação de correspondência exata de URL normalizada
+  const expectedUrl = `https://${expectedHostname}`;
+  const normalizedActualUrl = stagingUrl.replace(/\/+$/, '');
+  if (normalizedActualUrl !== expectedUrl) {
+    throw new Error(
+      `[BLOQUEIO DE SEGURANÇA: DISCREPÂNCIA DE URL] A URL configurada ("${normalizedActualUrl}") não corresponde exatamente ao formato canônico ("${expectedUrl}").`
+    );
+  }
+
+  // 7. Exigência de STAGING_SUPABASE_SERVICE_ROLE_KEY exclusiva (SEM fallback para SUPABASE_SERVICE_ROLE_KEY)
+  const rawServiceRoleKey = env.STAGING_SUPABASE_SERVICE_ROLE_KEY || '';
+  const serviceRoleKey = rawServiceRoleKey.trim();
+
+  if (!serviceRoleKey) {
+    if (env.SUPABASE_SERVICE_ROLE_KEY) {
+      throw new Error(
+        '[BLOQUEIO DE SEGURANÇA: FALLBACK DE PRODUÇÃO PROIBIDO] ' +
+        'Tentativa de utilizar SUPABASE_SERVICE_ROLE_KEY no ambiente de homologação. ' +
+        'O bootstrap exige estritamente STAGING_SUPABASE_SERVICE_ROLE_KEY e não aceita variáveis de produção como fallback.'
+      );
+    }
+    throw new Error(
+      '[BLOQUEIO DE SEGURANÇA: STAGING_SUPABASE_SERVICE_ROLE_KEY NÃO DETECTADA] A chave STAGING_SUPABASE_SERVICE_ROLE_KEY do projeto de staging é necessária.'
+    );
+  }
+
+  if (serviceRoleKey.includes('<') || serviceRoleKey.includes('>') || serviceRoleKey.includes('insira')) {
+    throw new Error(
+      '[BLOQUEIO DE SEGURANÇA: STAGING_SUPABASE_SERVICE_ROLE_KEY CONTÉM PLACEHOLDER] A chave service_role contém marcadores de template.'
+    );
+  }
+
+  // 8. Validação e seleção da porta de homologação (prioriza STAGING_PORT, fallback PORT, padrão 3001)
+  const rawPort = env.STAGING_PORT || env.PORT;
+  let port = 3001;
+
+  if (rawPort !== undefined && rawPort.trim() !== '') {
+    const trimmedPort = rawPort.trim();
+    if (trimmedPort.includes('<') || trimmedPort.includes('>') || trimmedPort.includes('insira')) {
+      throw new Error(
+        `[BLOQUEIO DE SEGURANÇA: PORTA DE STAGING CONTÉM PLACEHOLDER] A porta de homologação contém marcadores de template: "${rawPort}"`
+      );
+    }
+    const parsedPort = Number(trimmedPort);
+    if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+      throw new Error(
+        `[BLOQUEIO DE SEGURANÇA: PORTA DE STAGING INVÁLIDA] A porta deve ser um número inteiro válido entre 1 e 65535. Recebido: "${rawPort}"`
+      );
+    }
+    port = parsedPort;
+  }
+
+  return {
+    projectRef,
+    supabaseUrl: expectedUrl,
+    serviceRoleKey,
+    port,
+  };
+}
+
+/**
+ * Instancia o cliente Supabase isolado para staging a partir de configurações validadas.
+ */
+export function createStagingClient(config: StagingValidatedConfig): SupabaseClient {
+  return createClient(config.supabaseUrl, config.serviceRoleKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+}
+
+/**
+ * Ponto de entrada de bootstrap para o servidor de homologação.
+ * Carrega .env.staging (sem fallback para .env), valida configuração e instancia o cliente.
+ * Aborta o processo imediatamente caso ocorra qualquer erro de validação.
+ */
+export function validateAndBootstrapStaging(options?: StagingValidationOptions): StagingBootstrapResult {
+  console.log('=============================================================================');
+  console.log('PX CUSTOM — INICIALIZAÇÃO CONTROLADA DO BACKEND DE HOMOLOGAÇÃO (STAGING)');
+  console.log('=============================================================================');
+
+  try {
+    loadStagingEnvironment(options);
+  } catch (err: any) {
+    process.exit(1);
+  }
+
+  let config: StagingValidatedConfig;
+  try {
+    config = validateStagingConfig(process.env, options);
+  } catch (err: any) {
+    console.error('\n' + err.message + '\n');
+    process.exit(1);
+  }
+
+  const supabaseAdmin = createStagingClient(config);
+
+  console.log(`[STAGING BOOTSTRAP] Projeto Supabase Staging Validado: ${config.projectRef}`);
+  console.log(`[STAGING BOOTSTRAP] Endpoint Supabase Conectado: ${config.supabaseUrl}`);
+  console.log(`[STAGING BOOTSTRAP] Porta do Servidor Staging: ${config.port}`);
+  console.log('[STAGING BOOTSTRAP] Credenciais service_role verificadas (segredos não expostos).');
+  console.log('[STAGING BOOTSTRAP] Ambiente autorizado para processamento de homologação.');
+
+  return {
+    ...config,
+    supabaseAdmin,
+  };
+}

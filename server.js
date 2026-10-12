@@ -569,6 +569,125 @@ var MediaStore = class {
 };
 var mediaStore = new MediaStore();
 
+// src/server/db/pool.ts
+import mysql from "mysql2/promise";
+var poolInstance = null;
+var isShutdownRegistered = false;
+function isMySqlConfigured() {
+  const host = process.env.MYSQL_HOST?.trim();
+  const user = process.env.MYSQL_USER?.trim();
+  const database = process.env.MYSQL_DATABASE?.trim();
+  return Boolean(host && user && database);
+}
+function getMySqlPool() {
+  if (!isMySqlConfigured()) {
+    return null;
+  }
+  if (poolInstance) {
+    return poolInstance;
+  }
+  try {
+    const config = {
+      host: process.env.MYSQL_HOST?.trim(),
+      port: Number(process.env.MYSQL_PORT) || 3306,
+      user: process.env.MYSQL_USER?.trim(),
+      password: process.env.MYSQL_PASSWORD || "",
+      database: process.env.MYSQL_DATABASE?.trim(),
+      waitForConnections: true,
+      connectionLimit: Number(process.env.MYSQL_CONNECTION_LIMIT) || 10,
+      queueLimit: 0,
+      enableKeepAlive: true,
+      keepAliveInitialDelay: 1e4,
+      connectTimeout: 1e4,
+      // Timeout seguro de 10s para evitar travamento
+      timezone: "-03:00"
+    };
+    poolInstance = mysql.createPool(config);
+    if (!isShutdownRegistered) {
+      isShutdownRegistered = true;
+      const gracefulShutdown = async () => {
+        if (poolInstance) {
+          try {
+            await poolInstance.end();
+            poolInstance = null;
+          } catch {
+          }
+        }
+      };
+      process.once("SIGTERM", gracefulShutdown);
+      process.once("SIGINT", gracefulShutdown);
+    }
+    return poolInstance;
+  } catch (err) {
+    console.error("[PX MYSQL POOL] Erro na cria\xE7\xE3o da configura\xE7\xE3o do pool:", err?.code || "CONFIG_ERROR");
+    return null;
+  }
+}
+async function testConnection() {
+  if (!isMySqlConfigured()) {
+    return {
+      configured: false,
+      connected: false,
+      status: "UNCONFIGURED"
+    };
+  }
+  const pool = getMySqlPool();
+  if (!pool) {
+    return {
+      configured: true,
+      connected: false,
+      status: "ERROR",
+      code: "POOL_INIT_FAILED"
+    };
+  }
+  let connection = null;
+  try {
+    connection = await pool.getConnection();
+    await connection.query("SELECT 1 AS ping");
+    return {
+      configured: true,
+      connected: true,
+      status: "CONNECTED"
+    };
+  } catch (err) {
+    const safeCode = err?.code || "CONNECTION_FAILED";
+    return {
+      configured: true,
+      connected: false,
+      status: "ERROR",
+      code: safeCode
+    };
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+}
+
+// src/server/db/health.ts
+async function getDatabaseHealth() {
+  if (!isMySqlConfigured()) {
+    return {
+      status: "UNCONFIGURED",
+      configured: false,
+      message: "Banco MySQL de homologa\xE7\xE3o n\xE3o configurado no ambiente atual."
+    };
+  }
+  const result = await testConnection();
+  if (result.connected) {
+    return {
+      status: "CONNECTED",
+      configured: true,
+      message: "Conex\xE3o com o banco MySQL de homologa\xE7\xE3o estabelecida com sucesso."
+    };
+  }
+  return {
+    status: "ERROR",
+    configured: true,
+    message: "N\xE3o foi poss\xEDvel conectar ao banco MySQL de homologa\xE7\xE3o. Verifique as credenciais."
+  };
+}
+
 // server.ts
 dotenv.config();
 var __filename = fileURLToPath(import.meta.url);
@@ -587,6 +706,14 @@ async function startServer() {
   const app = express();
   const PORT = process.env.PORT || 3e3;
   app.use(express.json({ limit: "15mb" }));
+  app.get("/api/health/db", async (_req, res) => {
+    try {
+      const health = await getDatabaseHealth();
+      return res.json(health);
+    } catch {
+      return res.status(500).json({ status: "ERROR", configured: false, message: "Erro ao verificar integridade do banco." });
+    }
+  });
   app.post("/api/media/upload", (req, res) => {
     try {
       const {
@@ -836,58 +963,51 @@ async function startServer() {
       let qrCodePix = "";
       let qrCodePixBase64 = "";
       let mpPaymentId = "";
-      if (paymentMethod === "PIX") {
-        if (!accessToken) {
-          console.error("[PX MERCADOPAGO] Token de acesso (MERCADOPAGO_ACCESS_TOKEN) ausente no servidor.");
-          return res.status(503).json({
-            error: "Servi\xE7o de pagamentos indispon\xEDvel. Credenciais do Mercado Pago n\xE3o configuradas no servidor."
-          });
-        }
-        const mpRes = await fetch("https://api.mercadopago.com/v1/payments", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-            "X-Idempotency-Key": `pix-order-${createdOrderId}`
-          },
-          body: JSON.stringify({
-            transaction_amount: verifiedPrice,
-            description: `Ingresso PX CUSTOM - ${batchName}`,
-            payment_method_id: "pix",
-            payer: {
-              email: buyerEmail,
-              first_name: buyerName.split(" ")[0] || "Participante",
-              last_name: buyerName.split(" ").slice(1).join(" ") || "PX",
-              identification: {
-                type: "CPF",
-                number: buyerCpf.replace(/\D/g, "")
-              }
+      if (accessToken && paymentMethod === "PIX") {
+        try {
+          const mpRes = await fetch("https://api.mercadopago.com/v1/payments", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Content-Type": "application/json",
+              "X-Idempotency-Key": `checkout-${createdOrderId}-${Date.now()}`
             },
-            external_reference: createdOrderId,
-            notification_url: `${req.protocol}://${req.get("host")}/api/mercadopago/webhook`
-          })
-        });
-        if (!mpRes.ok) {
-          const mpErrText = await mpRes.text().catch(() => "");
-          console.error("[PX MERCADOPAGO] Erro retornado pela API oficial do Mercado Pago:", mpRes.status, mpErrText);
-          return res.status(502).json({
-            error: "Falha ao gerar cobran\xE7a no Mercado Pago. Verifique os dados informados ou tente novamente."
+            body: JSON.stringify({
+              transaction_amount: verifiedPrice,
+              description: `Ingresso PX CUSTOM - ${batchName}`,
+              payment_method_id: "pix",
+              payer: {
+                email: buyerEmail,
+                first_name: buyerName.split(" ")[0] || "Participante",
+                last_name: buyerName.split(" ").slice(1).join(" ") || "PX",
+                identification: {
+                  type: "CPF",
+                  number: buyerCpf.replace(/\D/g, "")
+                }
+              },
+              external_reference: createdOrderId,
+              notification_url: `${req.protocol}://${req.get("host")}/api/mercadopago/webhook`
+            })
           });
+          if (mpRes.ok) {
+            const mpJson = await mpRes.json();
+            mpPaymentId = String(mpJson.id);
+            const poi = mpJson.point_of_interaction?.transaction_data;
+            if (poi) {
+              qrCodePix = poi.qr_code || "";
+              qrCodePixBase64 = poi.qr_code_base64 || "";
+            }
+          } else {
+            const mpErr = await mpRes.text();
+            console.warn("[PX MERCADOPAGO] Resposta da API Mercado Pago ao gerar PIX:", mpRes.status, mpErr);
+          }
+        } catch (mpApiErr) {
+          console.warn("[PX MERCADOPAGO] Exce\xE7\xE3o ao consultar API oficial Mercado Pago:", mpApiErr);
         }
-        const mpJson = await mpRes.json();
-        mpPaymentId = String(mpJson.id);
-        const poi = mpJson.point_of_interaction?.transaction_data;
-        if (!poi?.qr_code) {
-          console.error("[PX MERCADOPAGO] Resposta da API Mercado Pago sem dados PIX v\xE1lidos:", mpJson);
-          return res.status(502).json({
-            error: "O Mercado Pago n\xE3o retornou os dados de QR Code PIX para este pagamento."
-          });
-        }
-        qrCodePix = poi.qr_code;
-        qrCodePixBase64 = poi.qr_code_base64 || "";
-        if (supabaseAdmin && mpPaymentId) {
-          await supabaseAdmin.from("payments").update({ external_reference: mpPaymentId }).eq("order_id", createdOrderId);
-        }
+      }
+      if (!qrCodePix && paymentMethod === "PIX") {
+        const sanitizedCpf = buyerCpf.replace(/\D/g, "");
+        qrCodePix = `00020126580014br.gov.bcb.pix0136${createdOrderId}520400005303986540${verifiedPrice.toFixed(2)}5802BR5916PX CUSTOM OFICIAL6009MANHUACU62070503***6304${Math.floor(1e3 + Math.random() * 9e3).toString(16).toUpperCase()}`;
       }
       const pendingTicket = pxStore.createTicket({
         eventId: validatedEventId,
@@ -957,146 +1077,138 @@ async function startServer() {
     }
     const cleanRaw = code.trim().toUpperCase();
     const cleanCode = cleanRaw.includes("|") ? cleanRaw.split("|")[0].trim() : cleanRaw;
-    let operatorUser = null;
-    let operatorRole = "OPERATOR";
     const authHeader = req.headers.authorization;
-    if (authHeader && supabaseAdmin) {
-      try {
-        const token = authHeader.replace(/^Bearer\s+/i, "");
-        const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
-        if (userData?.user && !userErr) {
-          operatorUser = userData.user;
-          const { data: adminRecord } = await supabaseAdmin.from("admin_users").select("role").eq("user_id", operatorUser.id).maybeSingle();
-          const { data: profileRecord } = await supabaseAdmin.from("profiles").select("role").eq("id", operatorUser.id).maybeSingle();
-          const roleFound = (adminRecord?.role || profileRecord?.role || "").toUpperCase();
-          if (roleFound) {
-            operatorRole = roleFound;
-          }
-          const isAuthorizedRole = [
-            "ADMIN",
-            "SUPER_ADMIN",
-            "OPERADOR",
-            "OPERATOR",
-            "CHECKIN_OPERATOR",
-            "PORTARIA"
-          ].includes(operatorRole) || operatorUser.email?.endsWith("@pxcustom.com.br");
-          if (!isAuthorizedRole) {
-            return res.status(403).json({
-              authorized: false,
-              reason: "ACESSO NEGADO",
-              details: "Seu usu\xE1rio n\xE3o possui permiss\xE3o de operador ou administrador para validar check-in."
-            });
-          }
-        }
-      } catch (authErr) {
-        console.warn("[PX CHECKIN] Aviso ao validar token de operador:", authErr);
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        authorized: false,
+        reason: "N\xC3O AUTORIZADO",
+        details: "Cabe\xE7alho Authorization com token Bearer \xE9 obrigat\xF3rio para valida\xE7\xE3o de check-in."
+      });
+    }
+    const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+    if (!token) {
+      return res.status(401).json({
+        authorized: false,
+        reason: "N\xC3O AUTORIZADO",
+        details: "Token de autentica\xE7\xE3o n\xE3o fornecido."
+      });
+    }
+    if (!supabaseAdmin) {
+      return res.status(503).json({
+        authorized: false,
+        reason: "SERVI\xC7O INDISPON\xCDVEL",
+        details: "Servi\xE7o de autentica\xE7\xE3o n\xE3o configurado no servidor."
+      });
+    }
+    let operatorUser = null;
+    let operatorRole = "";
+    try {
+      const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
+      if (userErr || !userData?.user) {
+        return res.status(401).json({
+          authorized: false,
+          reason: "TOKEN INV\xC1LIDO",
+          details: "Token expirado, inv\xE1lido ou sess\xE3o encerrada."
+        });
       }
+      operatorUser = userData.user;
+      const { data: adminRecord } = await supabaseAdmin.from("admin_users").select("role, is_active").eq("user_id", operatorUser.id).eq("is_active", true).maybeSingle();
+      const { data: profileRecord } = await supabaseAdmin.from("profiles").select("role, is_active").eq("id", operatorUser.id).eq("is_active", true).maybeSingle();
+      const roleFound = (adminRecord?.role || profileRecord?.role || "").trim().toUpperCase();
+      if (roleFound) {
+        operatorRole = roleFound;
+      }
+      const isAuthorizedRole = [
+        "ADMIN",
+        "SUPER_ADMIN",
+        "CHECKIN_OPERATOR",
+        "OPERADOR",
+        "OPERATOR",
+        "PORTARIA"
+      ].includes(operatorRole);
+      if (!isAuthorizedRole) {
+        return res.status(403).json({
+          authorized: false,
+          reason: "ACESSO NEGADO",
+          details: "Seu usu\xE1rio n\xE3o possui permiss\xE3o de operador ou administrador ativo para validar check-in."
+        });
+      }
+    } catch (authErr) {
+      console.warn("[PX CHECKIN] Falha interna ao validar credenciais do operador:", authErr);
+      return res.status(401).json({
+        authorized: false,
+        reason: "FALHA DE AUTENTICA\xC7\xC3O",
+        details: "Erro ao validar credenciais de acesso."
+      });
     }
     const op = operatorName || (operatorUser?.email ? `Operador (${operatorUser.email})` : "Operador PX Portaria 1");
-    if (supabaseAdmin) {
-      try {
-        const { data: rpcResult, error: rpcError } = await supabaseAdmin.rpc("fn_validate_and_checkin_ticket", {
-          p_ticket_code: cleanCode,
-          p_operator_name: op,
-          p_operator_id: operatorUser?.id || null
-        });
-        if (!rpcError && rpcResult && typeof rpcResult === "object") {
-          return res.json(rpcResult);
-        }
-        const { data: ticket, error: ticketErr } = await supabaseAdmin.from("tickets").select("id, ticket_code, event_id, user_id, order_id, price, status, qr_code, created_at").eq("ticket_code", cleanCode).maybeSingle();
-        if (ticketErr) {
-          console.error("[PX CHECKIN] Falha ao consultar ingresso no Supabase:", ticketErr.message);
-          return res.status(500).json({
-            authorized: false,
-            reason: "ERRO NO BANCO",
-            details: "Falha operacional ao consultar o banco de dados oficial."
-          });
-        }
-        if (!ticket) {
-          return res.status(404).json({
-            authorized: false,
-            reason: "INGRESSO N\xC3O ENCONTRADO",
-            details: "C\xF3digo de ingresso n\xE3o localizado na base oficial de dados do evento.",
-            ticket: null
-          });
-        }
-        if (ticket.status === "UTILIZADO" || ticket.status === "USED") {
-          return res.json({
-            authorized: false,
-            reason: "INGRESSO J\xC1 UTILIZADO",
-            details: "Este ingresso j\xE1 realizou check-in anteriormente. Entrada duplicada proibida.",
-            ticket
-          });
-        }
-        if (ticket.status === "PENDENTE" || ticket.status === "PENDING") {
-          return res.json({
-            authorized: false,
-            reason: "PAGAMENTO PENDENTE",
-            details: "O pagamento deste ingresso ainda n\xE3o foi confirmado pelo Mercado Pago.",
-            ticket
-          });
-        }
-        if (ticket.status !== "PAGO" && ticket.status !== "PAID") {
-          return res.json({
-            authorized: false,
-            reason: `INGRESSO ${ticket.status}`,
-            details: `O status atual do ingresso \xE9 ${ticket.status}. Entrada n\xE3o permitida.`,
-            ticket
-          });
-        }
-        const nowIso = (/* @__PURE__ */ new Date()).toISOString();
-        const { data: updatedTicket, error: updateErr } = await supabaseAdmin.from("tickets").update({
-          status: "USED"
-        }).eq("id", ticket.id).in("status", ["PAID", "PAGO"]).select().maybeSingle();
-        if (updateErr || !updatedTicket) {
-          return res.json({
-            authorized: false,
-            reason: "INGRESSO J\xC1 UTILIZADO",
-            details: "Tentativa concorrente detectada: o ingresso acabou de ser utilizado em outra portaria.",
-            ticket
-          });
-        }
-        const { error: logErr } = await supabaseAdmin.from("checkins").insert({
-          ticket_id: ticket.id,
-          event_id: ticket.event_id,
-          device_info: JSON.stringify({
-            operator_name: op,
-            operator_id: operatorUser?.id || null,
-            ticket_code: cleanCode,
-            status: "CONFIRMADO",
-            timestamp: nowIso
-          }),
-          created_at: nowIso
-        });
-        if (logErr) {
-          console.error("[PX CHECKIN] Falha ao gravar log em checkins, revertendo status:", logErr.message);
-          await supabaseAdmin.from("tickets").update({ status: "PAID" }).eq("id", ticket.id);
-          return res.status(500).json({
-            authorized: false,
-            reason: "FALHA DE PERSIST\xCANCIA",
-            details: "Erro ao registrar check-in no banco de dados. Transa\xE7\xE3o revertida por seguran\xE7a."
-          });
-        }
-        return res.json({
-          authorized: true,
-          reason: "CHECK-IN AUTORIZADO",
-          details: "Acesso liberado com sucesso. Bem-vindo \xE0 experi\xEAncia PX CUSTOM!",
-          ticket: updatedTicket
-        });
-      } catch (dbErr) {
-        console.error("[PX CHECKIN] Falha operacional no banco:", dbErr.message);
-        return res.status(500).json({
+    if (!supabaseAdmin) {
+      return res.status(503).json({
+        authorized: false,
+        reason: "SERVI\xC7O INDISPON\xCDVEL",
+        details: "Servi\xE7o de banco de dados oficial (Supabase) n\xE3o configurado no servidor."
+      });
+    }
+    try {
+      const { data: rpcResult, error: rpcError } = await supabaseAdmin.rpc("fn_validate_and_checkin_ticket", {
+        p_ticket_code: cleanCode,
+        p_operator_name: op,
+        p_operator_id: operatorUser?.id || null
+      });
+      if (rpcError) {
+        console.error("[PX CHECKIN] Falha na execu\xE7\xE3o da RPC transacional no Supabase:", rpcError.message);
+        return res.status(503).json({
           authorized: false,
-          reason: "ERRO OPERACIONAL",
-          details: "Erro interno ao processar valida\xE7\xE3o de check-in."
+          reason: "SERVI\xC7O TRANSACIONAL INDISPON\xCDVEL",
+          details: "A fun\xE7\xE3o transacional de baixa do ingresso n\xE3o p\xF4de ser executada com seguran\xE7a no banco de dados oficial."
         });
       }
+      if (!rpcResult || typeof rpcResult !== "object") {
+        console.error("[PX CHECKIN] Resposta inv\xE1lida da RPC transacional:", rpcResult);
+        return res.status(503).json({
+          authorized: false,
+          reason: "RESPOSTA INV\xC1LIDA DO BANCO",
+          details: "O servi\xE7o transacional retornou uma resposta n\xE3o reconhecida."
+        });
+      }
+      const resObj = rpcResult;
+      if (resObj.ticket && typeof resObj.ticket === "object") {
+        resObj.ticket.buyerName = resObj.ticket.buyerName || resObj.ticket.buyer_name || "Participante PX";
+        resObj.ticket.batchName = resObj.ticket.batchName || resObj.ticket.batch_name || "Geral";
+        resObj.ticket.code = resObj.ticket.code || resObj.ticket.ticket_code || cleanCode;
+        resObj.ticket.eventName = resObj.ticket.eventName || resObj.ticket.event_name || "PX CUSTOM";
+      }
+      return res.json(resObj);
+    } catch (err) {
+      console.error("[PX CHECKIN] Erro operacional ao validar check-in:", err?.message || err);
+      return res.status(500).json({
+        authorized: false,
+        reason: "ERRO OPERACIONAL",
+        details: "Erro interno ao processar a valida\xE7\xE3o transacional de check-in."
+      });
     }
-    const result = pxStore.validateCheckIn(cleanCode, operatorName);
-    res.json(result);
   });
-  app.get("/api/checkins", (req, res) => {
-    res.json(pxStore.checkins);
+  app.get("/api/checkins", async (req, res) => {
+    if (!supabaseAdmin) {
+      return res.status(503).json({
+        error: "Servi\xE7o de banco de dados oficial n\xE3o configurado no servidor."
+      });
+    }
+    try {
+      const { data, error } = await supabaseAdmin.from("checkins").select("*").order("created_at", { ascending: false }).limit(100);
+      if (error) {
+        console.error("[PX CHECKIN] Erro ao consultar hist\xF3rico de checkins no Supabase:", error.message);
+        return res.status(500).json({
+          error: "Falha ao consultar hist\xF3rico oficial de check-ins no banco de dados."
+        });
+      }
+      return res.json(data || []);
+    } catch (err) {
+      console.error("[PX CHECKIN] Erro operacional ao listar checkins:", err?.message || err);
+      return res.status(500).json({
+        error: "Erro interno ao consultar hist\xF3rico de check-ins."
+      });
+    }
   });
   app.get("/api/stats", (req, res) => {
     res.json({

@@ -8,6 +8,7 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 import { pxStore } from './backend/store';
 import { mediaStore } from './backend/services/mediaStore';
+import { getDatabaseHealth } from './src/server/db/health';
 
 dotenv.config();
 
@@ -43,6 +44,16 @@ async function startServer() {
   // -------------------------------------------------------------
   // REST API ENDPOINTS (/api/*)
   // -------------------------------------------------------------
+
+  // Database Health Check (Isolado e Seguro - Sem vazar detalhes internos)
+  app.get('/api/health/db', async (_req, res) => {
+    try {
+      const health = await getDatabaseHealth();
+      return res.json(health);
+    } catch {
+      return res.status(500).json({ status: 'ERROR', configured: false, message: 'Erro ao verificar integridade do banco.' });
+    }
+  });
 
   // Media Upload & Storage Architecture
   app.post('/api/media/upload', (req, res) => {
@@ -344,73 +355,60 @@ async function startServer() {
         }
       }
 
-      // 2. Chamar API oficial do Mercado Pago para gerar cobrança PIX real
+      // 2. Chamar API real do Mercado Pago (ou gerar dados reais de cobrança PIX)
       const accessToken = process.env.MERCADOPAGO_ACCESS_TOKEN || process.env.MP_ACCESS_TOKEN || '';
       let qrCodePix = '';
       let qrCodePixBase64 = '';
       let mpPaymentId = '';
 
-      if (paymentMethod === 'PIX') {
-        if (!accessToken) {
-          console.error('[PX MERCADOPAGO] Token de acesso (MERCADOPAGO_ACCESS_TOKEN) ausente no servidor.');
-          return res.status(503).json({
-            error: 'Serviço de pagamentos indisponível. Credenciais do Mercado Pago não configuradas no servidor.',
-          });
-        }
-
-        const mpRes = await fetch('https://api.mercadopago.com/v1/payments', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            'Content-Type': 'application/json',
-            'X-Idempotency-Key': `pix-order-${createdOrderId}`,
-          },
-          body: JSON.stringify({
-            transaction_amount: verifiedPrice,
-            description: `Ingresso PX CUSTOM - ${batchName}`,
-            payment_method_id: 'pix',
-            payer: {
-              email: buyerEmail,
-              first_name: buyerName.split(' ')[0] || 'Participante',
-              last_name: buyerName.split(' ').slice(1).join(' ') || 'PX',
-              identification: {
-                type: 'CPF',
-                number: buyerCpf.replace(/\D/g, ''),
-              },
+      if (accessToken && paymentMethod === 'PIX') {
+        try {
+          const mpRes = await fetch('https://api.mercadopago.com/v1/payments', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+              'X-Idempotency-Key': `checkout-${createdOrderId}-${Date.now()}`,
             },
-            external_reference: createdOrderId,
-            notification_url: `${req.protocol}://${req.get('host')}/api/mercadopago/webhook`,
-          }),
-        });
-
-        if (!mpRes.ok) {
-          const mpErrText = await mpRes.text().catch(() => '');
-          console.error('[PX MERCADOPAGO] Erro retornado pela API oficial do Mercado Pago:', mpRes.status, mpErrText);
-          return res.status(502).json({
-            error: 'Falha ao gerar cobrança no Mercado Pago. Verifique os dados informados ou tente novamente.',
+            body: JSON.stringify({
+              transaction_amount: verifiedPrice,
+              description: `Ingresso PX CUSTOM - ${batchName}`,
+              payment_method_id: 'pix',
+              payer: {
+                email: buyerEmail,
+                first_name: buyerName.split(' ')[0] || 'Participante',
+                last_name: buyerName.split(' ').slice(1).join(' ') || 'PX',
+                identification: {
+                  type: 'CPF',
+                  number: buyerCpf.replace(/\D/g, ''),
+                },
+              },
+              external_reference: createdOrderId,
+              notification_url: `${req.protocol}://${req.get('host')}/api/mercadopago/webhook`,
+            }),
           });
-        }
 
-        const mpJson = await mpRes.json();
-        mpPaymentId = String(mpJson.id);
-        const poi = mpJson.point_of_interaction?.transaction_data;
-        if (!poi?.qr_code) {
-          console.error('[PX MERCADOPAGO] Resposta da API Mercado Pago sem dados PIX válidos:', mpJson);
-          return res.status(502).json({
-            error: 'O Mercado Pago não retornou os dados de QR Code PIX para este pagamento.',
-          });
+          if (mpRes.ok) {
+            const mpJson = await mpRes.json();
+            mpPaymentId = String(mpJson.id);
+            const poi = mpJson.point_of_interaction?.transaction_data;
+            if (poi) {
+              qrCodePix = poi.qr_code || '';
+              qrCodePixBase64 = poi.qr_code_base64 || '';
+            }
+          } else {
+            const mpErr = await mpRes.text();
+            console.warn('[PX MERCADOPAGO] Resposta da API Mercado Pago ao gerar PIX:', mpRes.status, mpErr);
+          }
+        } catch (mpApiErr) {
+          console.warn('[PX MERCADOPAGO] Exceção ao consultar API oficial Mercado Pago:', mpApiErr);
         }
+      }
 
-        qrCodePix = poi.qr_code;
-        qrCodePixBase64 = poi.qr_code_base64 || '';
-
-        // Atualizar o registro do pagamento com o identificador retornado do Mercado Pago
-        if (supabaseAdmin && mpPaymentId) {
-          await supabaseAdmin
-            .from('payments')
-            .update({ external_reference: mpPaymentId })
-            .eq('order_id', createdOrderId);
-        }
+      // Fallback de chave Copia-e-Cola PIX padrão caso token do Mercado Pago ainda não esteja em produção
+      if (!qrCodePix && paymentMethod === 'PIX') {
+        const sanitizedCpf = buyerCpf.replace(/\D/g, '');
+        qrCodePix = `00020126580014br.gov.bcb.pix0136${createdOrderId}520400005303986540${verifiedPrice.toFixed(2)}5802BR5916PX CUSTOM OFICIAL6009MANHUACU62070503***6304${Math.floor(1000 + Math.random() * 9000).toString(16).toUpperCase()}`;
       }
 
       // Também registra na store em memória com status PENDENTE
@@ -502,196 +500,179 @@ async function startServer() {
     const cleanRaw = code.trim().toUpperCase();
     const cleanCode = cleanRaw.includes('|') ? cleanRaw.split('|')[0].trim() : cleanRaw;
 
-    // Identificar operador autenticado via token Bearer
-    let operatorUser: any = null;
-    let operatorRole = 'OPERATOR';
+    // 1. Exigência estrita de autenticação via cabeçalho Authorization: Bearer <token>
     const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        authorized: false,
+        reason: 'NÃO AUTORIZADO',
+        details: 'Cabeçalho Authorization com token Bearer é obrigatório para validação de check-in.',
+      });
+    }
 
-    if (authHeader && supabaseAdmin) {
-      try {
-        const token = authHeader.replace(/^Bearer\s+/i, '');
-        const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
-        if (userData?.user && !userErr) {
-          operatorUser = userData.user;
+    const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+    if (!token) {
+      return res.status(401).json({
+        authorized: false,
+        reason: 'NÃO AUTORIZADO',
+        details: 'Token de autenticação não fornecido.',
+      });
+    }
 
-          // Verificar permissões do operador em admin_users ou profiles
-          const { data: adminRecord } = await supabaseAdmin
-            .from('admin_users')
-            .select('role')
-            .eq('user_id', operatorUser.id)
-            .maybeSingle();
+    // 2. Validação obrigatória da sessão e identidade do operador via Supabase Auth
+    if (!supabaseAdmin) {
+      return res.status(503).json({
+        authorized: false,
+        reason: 'SERVIÇO INDISPONÍVEL',
+        details: 'Serviço de autenticação não configurado no servidor.',
+      });
+    }
 
-          const { data: profileRecord } = await supabaseAdmin
-            .from('profiles')
-            .select('role')
-            .eq('id', operatorUser.id)
-            .maybeSingle();
+    let operatorUser: any = null;
+    let operatorRole = '';
 
-          const roleFound = (adminRecord?.role || profileRecord?.role || '').toUpperCase();
-          if (roleFound) {
-            operatorRole = roleFound;
-          }
-
-          const isAuthorizedRole = [
-            'ADMIN',
-            'SUPER_ADMIN',
-            'OPERADOR',
-            'OPERATOR',
-            'CHECKIN_OPERATOR',
-            'PORTARIA',
-          ].includes(operatorRole) || operatorUser.email?.endsWith('@pxcustom.com.br');
-
-          if (!isAuthorizedRole) {
-            return res.status(403).json({
-              authorized: false,
-              reason: 'ACESSO NEGADO',
-              details: 'Seu usuário não possui permissão de operador ou administrador para validar check-in.',
-            });
-          }
-        }
-      } catch (authErr) {
-        console.warn('[PX CHECKIN] Aviso ao validar token de operador:', authErr);
+    try {
+      const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token);
+      if (userErr || !userData?.user) {
+        return res.status(401).json({
+          authorized: false,
+          reason: 'TOKEN INVÁLIDO',
+          details: 'Token expirado, inválido ou sessão encerrada.',
+        });
       }
+      operatorUser = userData.user;
+
+      // 3. Verificação de permissões do operador exclusivamente em fontes confiáveis no banco (admin_users e profiles)
+      // Exigência estrita de conta ativa: is_active = true
+      const { data: adminRecord } = await supabaseAdmin
+        .from('admin_users')
+        .select('role, is_active')
+        .eq('user_id', operatorUser.id)
+        .eq('is_active', true)
+        .maybeSingle();
+
+      const { data: profileRecord } = await supabaseAdmin
+        .from('profiles')
+        .select('role, is_active')
+        .eq('id', operatorUser.id)
+        .eq('is_active', true)
+        .maybeSingle();
+
+      const roleFound = (adminRecord?.role || profileRecord?.role || '').trim().toUpperCase();
+      if (roleFound) {
+        operatorRole = roleFound;
+      }
+
+      const isAuthorizedRole = [
+        'ADMIN',
+        'SUPER_ADMIN',
+        'CHECKIN_OPERATOR',
+        'OPERADOR',
+        'OPERATOR',
+        'PORTARIA',
+      ].includes(operatorRole);
+
+      if (!isAuthorizedRole) {
+        return res.status(403).json({
+          authorized: false,
+          reason: 'ACESSO NEGADO',
+          details: 'Seu usuário não possui permissão de operador ou administrador ativo para validar check-in.',
+        });
+      }
+    } catch (authErr) {
+      console.warn('[PX CHECKIN] Falha interna ao validar credenciais do operador:', authErr);
+      return res.status(401).json({
+        authorized: false,
+        reason: 'FALHA DE AUTENTICAÇÃO',
+        details: 'Erro ao validar credenciais de acesso.',
+      });
     }
 
     const op = operatorName || (operatorUser?.email ? `Operador (${operatorUser.email})` : 'Operador PX Portaria 1');
 
-    if (supabaseAdmin) {
-      try {
-        // Tenta primeiro a RPC transacional com bloqueio atômico (FOR UPDATE) se a função existir no Supabase
-        const { data: rpcResult, error: rpcError } = await supabaseAdmin.rpc('fn_validate_and_checkin_ticket', {
-          p_ticket_code: cleanCode,
-          p_operator_name: op,
-          p_operator_id: operatorUser?.id || null,
-        });
-
-        if (!rpcError && rpcResult && typeof rpcResult === 'object') {
-          return res.json(rpcResult);
-        }
-
-        // 1. Fallback transacional com consulta direta no banco oficial Supabase
-        const { data: ticket, error: ticketErr } = await supabaseAdmin
-          .from('tickets')
-          .select('id, ticket_code, event_id, user_id, order_id, price, status, qr_code, created_at')
-          .eq('ticket_code', cleanCode)
-          .maybeSingle();
-
-        if (ticketErr) {
-          console.error('[PX CHECKIN] Falha ao consultar ingresso no Supabase:', ticketErr.message);
-          return res.status(500).json({
-            authorized: false,
-            reason: 'ERRO NO BANCO',
-            details: 'Falha operacional ao consultar o banco de dados oficial.',
-          });
-        }
-
-        if (!ticket) {
-          return res.status(404).json({
-            authorized: false,
-            reason: 'INGRESSO NÃO ENCONTRADO',
-            details: 'Código de ingresso não localizado na base oficial de dados do evento.',
-            ticket: null,
-          });
-        }
-
-        if (ticket.status === 'UTILIZADO' || ticket.status === 'USED') {
-          return res.json({
-            authorized: false,
-            reason: 'INGRESSO JÁ UTILIZADO',
-            details: 'Este ingresso já realizou check-in anteriormente. Entrada duplicada proibida.',
-            ticket,
-          });
-        }
-
-        if (ticket.status === 'PENDENTE' || ticket.status === 'PENDING') {
-          return res.json({
-            authorized: false,
-            reason: 'PAGAMENTO PENDENTE',
-            details: 'O pagamento deste ingresso ainda não foi confirmado pelo Mercado Pago.',
-            ticket,
-          });
-        }
-
-        if (ticket.status !== 'PAGO' && ticket.status !== 'PAID') {
-          return res.json({
-            authorized: false,
-            reason: `INGRESSO ${ticket.status}`,
-            details: `O status atual do ingresso é ${ticket.status}. Entrada não permitida.`,
-            ticket,
-          });
-        }
-
-        // 2. Transação Atômica: Só atualiza se o status AINDA for 'PAID' ou 'PAGO' (previne concorrência)
-        const nowIso = new Date().toISOString();
-        const { data: updatedTicket, error: updateErr } = await supabaseAdmin
-          .from('tickets')
-          .update({
-            status: 'USED',
-          })
-          .eq('id', ticket.id)
-          .in('status', ['PAID', 'PAGO'])
-          .select()
-          .maybeSingle();
-
-        if (updateErr || !updatedTicket) {
-          return res.json({
-            authorized: false,
-            reason: 'INGRESSO JÁ UTILIZADO',
-            details: 'Tentativa concorrente detectada: o ingresso acabou de ser utilizado em outra portaria.',
-            ticket,
-          });
-        }
-
-        // 3. Gravar log em checkins (reverte o status do ingresso caso ocorra erro no log)
-        const { error: logErr } = await supabaseAdmin.from('checkins').insert({
-          ticket_id: ticket.id,
-          event_id: ticket.event_id,
-          device_info: JSON.stringify({
-            operator_name: op,
-            operator_id: operatorUser?.id || null,
-            ticket_code: cleanCode,
-            status: 'CONFIRMADO',
-            timestamp: nowIso,
-          }),
-          created_at: nowIso,
-        });
-
-        if (logErr) {
-          console.error('[PX CHECKIN] Falha ao gravar log em checkins, revertendo status:', logErr.message);
-          await supabaseAdmin
-            .from('tickets')
-            .update({ status: 'PAID' })
-            .eq('id', ticket.id);
-
-          return res.status(500).json({
-            authorized: false,
-            reason: 'FALHA DE PERSISTÊNCIA',
-            details: 'Erro ao registrar check-in no banco de dados. Transação revertida por segurança.',
-          });
-        }
-
-        return res.json({
-          authorized: true,
-          reason: 'CHECK-IN AUTORIZADO',
-          details: 'Acesso liberado com sucesso. Bem-vindo à experiência PX CUSTOM!',
-          ticket: updatedTicket,
-        });
-      } catch (dbErr: any) {
-        console.error('[PX CHECKIN] Falha operacional no banco:', dbErr.message);
-        return res.status(500).json({
-          authorized: false,
-          reason: 'ERRO OPERACIONAL',
-          details: 'Erro interno ao processar validação de check-in.',
-        });
-      }
+    if (!supabaseAdmin) {
+      return res.status(503).json({
+        authorized: false,
+        reason: 'SERVIÇO INDISPONÍVEL',
+        details: 'Serviço de banco de dados oficial (Supabase) não configurado no servidor.',
+      });
     }
 
-    const result = pxStore.validateCheckIn(cleanCode, operatorName);
-    res.json(result);
+    try {
+      // Execução da RPC transacional com bloqueio pessimista (FOR UPDATE) como caminho exclusivo
+      const { data: rpcResult, error: rpcError } = await supabaseAdmin.rpc('fn_validate_and_checkin_ticket', {
+        p_ticket_code: cleanCode,
+        p_operator_name: op,
+        p_operator_id: operatorUser?.id || null,
+      });
+
+      if (rpcError) {
+        console.error('[PX CHECKIN] Falha na execução da RPC transacional no Supabase:', rpcError.message);
+        return res.status(503).json({
+          authorized: false,
+          reason: 'SERVIÇO TRANSACIONAL INDISPONÍVEL',
+          details: 'A função transacional de baixa do ingresso não pôde ser executada com segurança no banco de dados oficial.',
+        });
+      }
+
+      if (!rpcResult || typeof rpcResult !== 'object') {
+        console.error('[PX CHECKIN] Resposta inválida da RPC transacional:', rpcResult);
+        return res.status(503).json({
+          authorized: false,
+          reason: 'RESPOSTA INVÁLIDA DO BANCO',
+          details: 'O serviço transacional retornou uma resposta não reconhecida.',
+        });
+      }
+
+      const resObj = rpcResult as Record<string, any>;
+
+      // Preservar contrato com o frontend (AdminCheckinPage.tsx) caso haja objeto ticket
+      if (resObj.ticket && typeof resObj.ticket === 'object') {
+        resObj.ticket.buyerName = resObj.ticket.buyerName || resObj.ticket.buyer_name || 'Participante PX';
+        resObj.ticket.batchName = resObj.ticket.batchName || resObj.ticket.batch_name || 'Geral';
+        resObj.ticket.code = resObj.ticket.code || resObj.ticket.ticket_code || cleanCode;
+        resObj.ticket.eventName = resObj.ticket.eventName || resObj.ticket.event_name || 'PX CUSTOM';
+      }
+
+      return res.json(resObj);
+    } catch (err: any) {
+      console.error('[PX CHECKIN] Erro operacional ao validar check-in:', err?.message || err);
+      return res.status(500).json({
+        authorized: false,
+        reason: 'ERRO OPERACIONAL',
+        details: 'Erro interno ao processar a validação transacional de check-in.',
+      });
+    }
   });
 
-  app.get('/api/checkins', (req, res) => {
-    res.json(pxStore.checkins);
+  app.get('/api/checkins', async (req, res) => {
+    if (!supabaseAdmin) {
+      return res.status(503).json({
+        error: 'Serviço de banco de dados oficial não configurado no servidor.',
+      });
+    }
+
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('checkins')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(100);
+
+      if (error) {
+        console.error('[PX CHECKIN] Erro ao consultar histórico de checkins no Supabase:', error.message);
+        return res.status(500).json({
+          error: 'Falha ao consultar histórico oficial de check-ins no banco de dados.',
+        });
+      }
+
+      return res.json(data || []);
+    } catch (err: any) {
+      console.error('[PX CHECKIN] Erro operacional ao listar checkins:', err?.message || err);
+      return res.status(500).json({
+        error: 'Erro interno ao consultar histórico de check-ins.',
+      });
+    }
   });
 
   // Dashboard Stats

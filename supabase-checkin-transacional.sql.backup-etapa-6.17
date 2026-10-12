@@ -1,0 +1,243 @@
+-- =============================================================================
+-- PX CUSTON — FUNÇÃO TRANSACIONAL DE CHECK-IN ATÔMICO
+-- Arquivo: /supabase-checkin-transacional.sql
+-- VERSÃO: 6.14 — RESTRIÇÃO EXCLUSIVA DE PRIVILÉGIOS A SERVICE_ROLE
+-- ESCOPO: Prevenir concorrência e garantir atomicidade (tickets + log de checkins)
+-- REQUISITOS DO SCHEMA REMOTO CONFIRMADO:
+--   - tickets: ticket_code (não code), status ('PAID', 'USED', 'PENDING', 'CANCELLED'),
+--              holder_name (não buyer_name), sem checked_in_at / checked_in_by
+--   - checkins: id, ticket_id, event_id, device_info (JSON), ip_address, created_at
+--   - admin_users: user_id, role ('ADMIN', 'SUPER_ADMIN', 'CHECKIN_OPERATOR')
+--   - profiles: id, role ('ADMIN', 'SUPER_ADMIN', 'CHECKIN_OPERATOR', 'USER')
+-- REGRAS DE HARDENING (ETAPAS 6.12 e 6.14):
+--   - p_operator_id obrigatório (rejeição imediata se NULL)
+--   - Validação estrita de operador sem bypass por ausência de administradores
+--   - Resolução dinâmica e resiliente de metadados sem dependência estática de colunas não comprovadas
+--   - Privilégios restritos exclusivamente a service_role (bloqueio de PostgREST para anon e authenticated)
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION public.fn_validate_and_checkin_ticket(
+    p_ticket_code VARCHAR,
+    p_operator_name VARCHAR DEFAULT 'Operador PX Portaria',
+    p_operator_id UUID DEFAULT NULL
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_ticket RECORD;
+    v_now TIMESTAMPTZ := NOW();
+    v_clean_code VARCHAR;
+    v_ticket_code_val VARCHAR;
+    v_attendee_name VARCHAR := 'Participante PX';
+    v_batch_name VARCHAR := 'Geral';
+    v_event_name VARCHAR := 'PX CUSTOM';
+    v_device_info TEXT;
+BEGIN
+    -- 1. Sanitização do código do ingresso recebido (suporta formato CODE ou CODE|EVENT_ID|STATUS)
+    v_clean_code := UPPER(TRIM(SPLIT_PART(p_ticket_code, '|', 1)));
+
+    IF v_clean_code IS NULL OR v_clean_code = '' THEN
+        RETURN jsonb_build_object(
+            'authorized', FALSE,
+            'reason', 'CÓDIGO AUSENTE',
+            'details', 'Informe o código do ingresso ou escaneie o QR Code.'
+        );
+    END IF;
+
+    -- 2. Hardening: Identificador do operador é estritamente obrigatório
+    IF p_operator_id IS NULL THEN
+        RETURN jsonb_build_object(
+            'authorized', FALSE,
+            'reason', 'OPERADOR NÃO IDENTIFICADO',
+            'details', 'Identificador do operador de portaria é obrigatório para validação de check-in.'
+        );
+    END IF;
+
+    -- 3. Hardening: Validação incondicional do operador em fontes confiáveis no banco (admin_users e profiles)
+    -- Papéis autorizados exclusivamente: ADMIN, SUPER_ADMIN, CHECKIN_OPERATOR
+    -- Sem fallback por banco vazio: operador DEVE estar previamente cadastrado e ativo
+    IF NOT EXISTS (
+        SELECT 1 FROM public.admin_users WHERE user_id = p_operator_id AND role::text IN ('ADMIN', 'SUPER_ADMIN', 'CHECKIN_OPERATOR')
+        UNION
+        SELECT 1 FROM public.profiles WHERE id = p_operator_id AND role::text IN ('ADMIN', 'SUPER_ADMIN', 'CHECKIN_OPERATOR')
+    ) THEN
+        RETURN jsonb_build_object(
+            'authorized', FALSE,
+            'reason', 'OPERADOR NÃO AUTORIZADO',
+            'details', 'O operador informado não possui credenciais autorizadas para realizar check-in.'
+        );
+    END IF;
+
+    -- 4. Bloqueio pessimista de linha (FOR UPDATE) na tabela tickets pela coluna oficial ticket_code
+    SELECT *
+    INTO v_ticket
+    FROM public.tickets
+    WHERE UPPER(ticket_code) = v_clean_code
+    FOR UPDATE;
+
+    -- 5. Validação de existência do ingresso
+    IF v_ticket IS NULL OR v_ticket.id IS NULL THEN
+        RETURN jsonb_build_object(
+            'authorized', FALSE,
+            'reason', 'INGRESSO NÃO ENCONTRADO',
+            'details', 'Código de ingresso não localizado na base oficial do evento.',
+            'ticket', NULL
+        );
+    END IF;
+
+    -- 6. Validação de status: Impedir reuso (Duplo Check-in)
+    IF v_ticket.status::text IN ('USED', 'UTILIZADO') THEN
+        RETURN jsonb_build_object(
+            'authorized', FALSE,
+            'reason', 'INGRESSO JÁ UTILIZADO',
+            'details', 'Este ingresso já realizou check-in anteriormente. Entrada duplicada proibida.',
+            'ticket', row_to_json(v_ticket)
+        );
+    END IF;
+
+    -- 7. Validação de status: Pagamento pendente
+    IF v_ticket.status::text IN ('PENDING', 'PENDENTE') THEN
+        RETURN jsonb_build_object(
+            'authorized', FALSE,
+            'reason', 'PAGAMENTO PENDENTE',
+            'details', 'O pagamento deste ingresso ainda não foi confirmado pelo Mercado Pago.',
+            'ticket', row_to_json(v_ticket)
+        );
+    END IF;
+
+    -- 8. Validação de status: Somente PAID / PAGO é elegível
+    IF v_ticket.status::text NOT IN ('PAID', 'PAGO') THEN
+        RETURN jsonb_build_object(
+            'authorized', FALSE,
+            'reason', FORMAT('INGRESSO %s', v_ticket.status),
+            'details', FORMAT('O status atual do ingresso é %s. Entrada não permitida.', v_ticket.status),
+            'ticket', row_to_json(v_ticket)
+        );
+    END IF;
+
+    -- 9. Transação Atômica: Baixa do ingresso (atualização exclusiva de colunas reais)
+    UPDATE public.tickets
+    SET status = 'USED',
+        updated_at = v_now
+    WHERE id = v_ticket.id;
+
+    v_ticket.status := 'USED';
+    v_ticket.updated_at := v_now;
+
+    -- 10. Resolução de metadados para auditoria (com tratamento resiliente)
+    BEGIN
+        IF v_ticket.ticket_code IS NOT NULL AND TRIM(v_ticket.ticket_code) <> '' THEN
+            v_ticket_code_val := TRIM(v_ticket.ticket_code);
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        v_ticket_code_val := v_clean_code;
+    END;
+    IF v_ticket_code_val IS NULL OR v_ticket_code_val = '' THEN
+        v_ticket_code_val := v_clean_code;
+    END IF;
+
+    BEGIN
+        IF v_ticket.holder_name IS NOT NULL AND TRIM(v_ticket.holder_name) <> '' THEN
+            v_attendee_name := TRIM(v_ticket.holder_name);
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        v_attendee_name := 'Participante PX';
+    END;
+
+    -- Resolução do nome do lote: padrão 'Geral'; consulta dinâmica para não depender de colunas não comprovadas
+    v_batch_name := 'Geral';
+    IF v_ticket.ticket_type_id IS NOT NULL THEN
+        BEGIN
+            EXECUTE 'SELECT COALESCE(name, ''Geral'') FROM public.ticket_types WHERE id = $1'
+            INTO v_batch_name
+            USING v_ticket.ticket_type_id;
+        EXCEPTION WHEN OTHERS THEN
+            v_batch_name := 'Geral';
+        END;
+    END IF;
+    IF v_batch_name IS NULL OR v_batch_name = '' THEN
+        v_batch_name := 'Geral';
+    END IF;
+
+    -- Resolução do título do evento (coluna comprovada: events.title)
+    BEGIN
+        IF v_ticket.event_id IS NOT NULL THEN
+            SELECT COALESCE(title, 'PX CUSTOM') INTO v_event_name
+            FROM public.events
+            WHERE id = v_ticket.event_id;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        v_event_name := 'PX CUSTOM';
+    END;
+
+    -- 11. Serialização estruturada dos metadados de portaria no campo device_info
+    v_device_info := jsonb_build_object(
+        'ticket_code', v_ticket_code_val,
+        'attendee_name', v_attendee_name,
+        'batch_name', v_batch_name,
+        'event_name', v_event_name,
+        'operator_name', COALESCE(p_operator_name, 'Operador PX Portaria'),
+        'operator_id', p_operator_id,
+        'status', 'CONFIRMADO',
+        'checked_in_at', v_now
+    )::text;
+
+    -- 12. Transação Atômica: Inserção do registro de check-in em public.checkins
+    -- Utiliza estritamente as colunas reais da tabela remota: ticket_id, event_id, device_info, created_at
+    INSERT INTO public.checkins (
+        ticket_id,
+        event_id,
+        device_info,
+        created_at
+    ) VALUES (
+        v_ticket.id,
+        v_ticket.event_id,
+        v_device_info,
+        v_now
+    );
+
+    -- 13. Retorno padronizado em JSON, preservando o contrato esperado por server.ts e frontend
+    RETURN jsonb_build_object(
+        'authorized', TRUE,
+        'reason', 'CHECK-IN AUTORIZADO',
+        'details', 'Acesso liberado com sucesso. Bem-vindo à experiência PX CUSTOM!',
+        'ticket', jsonb_build_object(
+            'id', v_ticket.id,
+            'ticket_code', v_ticket_code_val,
+            'code', v_ticket_code_val,
+            'status', 'USED',
+            'event_id', v_ticket.event_id,
+            'event_name', v_event_name,
+            'eventName', v_event_name,
+            'holder_name', v_attendee_name,
+            'buyer_name', v_attendee_name,
+            'buyerName', v_attendee_name,
+            'batch_name', v_batch_name,
+            'batchName', v_batch_name,
+            'price', v_ticket.price,
+            'qr_code', v_ticket.qr_code,
+            'updated_at', v_now
+        ),
+        'log', jsonb_build_object(
+            'ticketCode', v_ticket_code_val,
+            'attendeeName', v_attendee_name,
+            'batchName', v_batch_name,
+            'eventName', v_event_name,
+            'operatorName', COALESCE(p_operator_name, 'Operador PX Portaria'),
+            'status', 'CONFIRMADO',
+            'timestamp', TO_CHAR(v_now AT TIME ZONE 'America/Sao_Paulo', 'DD/MM/YYYY • HH24:MI')
+        )
+    );
+END;
+$$;
+
+-- Restrição estrita de privilégios de execução: acesso exclusivo via backend com service_role
+REVOKE EXECUTE ON FUNCTION public.fn_validate_and_checkin_ticket(VARCHAR, VARCHAR, UUID)
+FROM PUBLIC, anon, authenticated;
+
+GRANT EXECUTE ON FUNCTION public.fn_validate_and_checkin_ticket(VARCHAR, VARCHAR, UUID)
+TO service_role;
+

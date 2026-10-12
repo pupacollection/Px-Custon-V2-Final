@@ -1,0 +1,336 @@
+/**
+ * PX CUSTOM — TESTES UNITÁRIOS LOCAIS DE FALHA SEGURA DO BOOTSTRAP (ETAPA 6.33)
+ * Arquivo: scripts/test-staging-bootstrap-unit.ts
+ *
+ * ESCOPO:
+ * Validar estaticamente e de forma 100% isolada que o validador de bootstrap
+ * de homologação rejeita todas as combinações de configurações inseguras,
+ * sem conexão de rede, sem instanciar clientes Supabase e sem efeitos colaterais.
+ *
+ * GARANTIAS:
+ * 1. Valores 100% sintéticos e fictícios.
+ * 2. Zero requisições HTTP ou conexões a bancos de dados.
+ * 3. Validação isolada de funções puras (validateStagingConfig e loadStagingEnvironment).
+ * 4. Saída explícita com exit code 0 (sucesso total) ou 1 (falha nas asserções).
+ */
+
+import assert from 'node:assert/strict';
+import {
+  validateStagingConfig,
+  loadStagingEnvironment,
+  StagingValidatedConfig,
+} from '../src/server/staging-bootstrap';
+
+const VALID_STAGING_REF = 'abcdefghijklmnopqrst'; // 20 caracteres alfanuméricos fictícios
+const VALID_SUPABASE_URL = `https://${VALID_STAGING_REF}.supabase.co`;
+const DUMMY_SERVICE_ROLE_KEY = 'synthetic_dummy_staging_key_not_real_1234567890';
+
+function getValidMockEnv(): Record<string, string> {
+  return {
+    PX_ENV: 'staging',
+    STAGING_PROJECT_REF: VALID_STAGING_REF,
+    SUPABASE_URL: VALID_SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY: DUMMY_SERVICE_ROLE_KEY,
+  };
+}
+
+let totalTests = 0;
+let passedTests = 0;
+
+function runTestCase(name: string, fn: () => void) {
+  totalTests++;
+  try {
+    fn();
+    passedTests++;
+    console.log(`  ✓ [PASS] ${name}`);
+  } catch (err: any) {
+    console.error(`  ✗ [FAIL] ${name}`);
+    console.error(`    Erro: ${err.message || err}`);
+    throw err;
+  }
+}
+
+console.log('=============================================================================');
+console.log('PX CUSTOM — SUÍTE DE TESTES UNITÁRIOS DE FALHA SEGURA (ETAPA 6.33)');
+console.log('=============================================================================');
+console.log('Executando asserções puras em memória (sem rede, sem Supabase, sem SQL)...\n');
+
+// -----------------------------------------------------------------------------
+// 1. Caso Base: Configuração Válida de Homologação
+// -----------------------------------------------------------------------------
+runTestCase('1. Deve aceitar configuração de homologação 100% válida e canônica', () => {
+  const env = getValidMockEnv();
+  const config = validateStagingConfig(env);
+  assert.equal(config.projectRef, VALID_STAGING_REF);
+  assert.equal(config.supabaseUrl, VALID_SUPABASE_URL);
+  assert.equal(config.serviceRoleKey, DUMMY_SERVICE_ROLE_KEY);
+  assert.equal(config.port, 3001);
+});
+
+// -----------------------------------------------------------------------------
+// 2. Validações de PX_ENV
+// -----------------------------------------------------------------------------
+runTestCase('2.1 Deve rejeitar PX_ENV ausente', () => {
+  const env = getValidMockEnv();
+  delete env.PX_ENV;
+  assert.throws(
+    () => validateStagingConfig(env),
+    /AMBIENTE NÃO AUTORIZADO.*PX_ENV deve ser estritamente "staging"/
+  );
+});
+
+runTestCase('2.2 Deve rejeitar PX_ENV com valor "production"', () => {
+  const env = getValidMockEnv();
+  env.PX_ENV = 'production';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /AMBIENTE NÃO AUTORIZADO.*PX_ENV deve ser estritamente "staging"/
+  );
+});
+
+runTestCase('2.3 Deve rejeitar PX_ENV com valor "dev" ou "development"', () => {
+  const env = getValidMockEnv();
+  env.PX_ENV = 'development';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /AMBIENTE NÃO AUTORIZADO.*PX_ENV deve ser estritamente "staging"/
+  );
+});
+
+// -----------------------------------------------------------------------------
+// 3. Validações de STAGING_PROJECT_REF
+// -----------------------------------------------------------------------------
+runTestCase('3.1 Deve rejeitar STAGING_PROJECT_REF ausente', () => {
+  const env = getValidMockEnv();
+  delete env.STAGING_PROJECT_REF;
+  assert.throws(
+    () => validateStagingConfig(env),
+    /STAGING_PROJECT_REF NÃO INFORMADO/
+  );
+});
+
+runTestCase('3.2 Deve rejeitar STAGING_PROJECT_REF contendo placeholder (<...>)', () => {
+  const env = getValidMockEnv();
+  env.STAGING_PROJECT_REF = '<insira_aqui_o_project_ref_de_staging>';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /STAGING_PROJECT_REF CONTÉM PLACEHOLDER/
+  );
+});
+
+runTestCase('3.3 Deve rejeitar STAGING_PROJECT_REF com slug descritivo em vez do ID alfanumérico', () => {
+  const env = getValidMockEnv();
+  env.STAGING_PROJECT_REF = 'px-custom-staging'; // slugs com hífen não são project refs canônicos
+  assert.throws(
+    () => validateStagingConfig(env),
+    /FORMATO DE STAGING_PROJECT_REF INVÁLIDO/
+  );
+});
+
+runTestCase('3.4 Deve rejeitar STAGING_PROJECT_REF muito curto ou com caracteres inválidos', () => {
+  const env = getValidMockEnv();
+  env.STAGING_PROJECT_REF = 'abc_123';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /FORMATO DE STAGING_PROJECT_REF INVÁLIDO/
+  );
+});
+
+// -----------------------------------------------------------------------------
+// 4. Validações de SUPABASE_URL
+// -----------------------------------------------------------------------------
+runTestCase('4.1 Deve rejeitar SUPABASE_URL ausente', () => {
+  const env = getValidMockEnv();
+  delete env.SUPABASE_URL;
+  assert.throws(
+    () => validateStagingConfig(env),
+    /SUPABASE_URL NÃO DEFINIDA/
+  );
+});
+
+runTestCase('4.2 Deve rejeitar SUPABASE_URL contendo placeholder (<...>)', () => {
+  const env = getValidMockEnv();
+  env.SUPABASE_URL = 'https://<insira_aqui_o_project_ref_de_staging>.supabase.co';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /SUPABASE_URL CONTÉM PLACEHOLDER/
+  );
+});
+
+runTestCase('4.3 Deve rejeitar SUPABASE_URL com formato sintaticamente inválido', () => {
+  const env = getValidMockEnv();
+  env.SUPABASE_URL = '://invalid-format-url';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /URL INVÁLIDA/
+  );
+});
+
+runTestCase('4.4 Deve rejeitar SUPABASE_URL utilizando protocolo HTTP inseguro', () => {
+  const env = getValidMockEnv();
+  env.SUPABASE_URL = `http://${VALID_STAGING_REF}.supabase.co`;
+  assert.throws(
+    () => validateStagingConfig(env),
+    /PROTOCOLO INSEGURO/
+  );
+});
+
+runTestCase('4.5 Deve rejeitar SUPABASE_URL com credenciais de usuário/senha embutidas', () => {
+  const env = getValidMockEnv();
+  env.SUPABASE_URL = `https://admin:secret@${VALID_STAGING_REF}.supabase.co`;
+  assert.throws(
+    () => validateStagingConfig(env),
+    /CREDENCIAIS EMBUTIDAS NA URL/
+  );
+});
+
+runTestCase('4.6 Deve rejeitar SUPABASE_URL com porta personalizada não autorizada', () => {
+  const env = getValidMockEnv();
+  env.SUPABASE_URL = `https://${VALID_STAGING_REF}.supabase.co:8443`;
+  assert.throws(
+    () => validateStagingConfig(env),
+    /PORTA NÃO AUTORIZADA/
+  );
+});
+
+runTestCase('4.7 Deve rejeitar SUPABASE_URL contendo subpasta ou caminho adicional', () => {
+  const env = getValidMockEnv();
+  env.SUPABASE_URL = `https://${VALID_STAGING_REF}.supabase.co/rest/v1`;
+  assert.throws(
+    () => validateStagingConfig(env),
+    /CAMINHO NÃO AUTORIZADO/
+  );
+});
+
+runTestCase('4.8 Deve rejeitar SUPABASE_URL contendo query string ou fragmento', () => {
+  const env = getValidMockEnv();
+  env.SUPABASE_URL = `https://${VALID_STAGING_REF}.supabase.co?token=xyz`;
+  assert.throws(
+    () => validateStagingConfig(env),
+    /PARÂMETROS NÃO AUTORIZADOS/
+  );
+});
+
+runTestCase('4.9 Deve rejeitar SUPABASE_URL apontando para projeto divergente do STAGING_PROJECT_REF', () => {
+  const env = getValidMockEnv();
+  env.SUPABASE_URL = 'https://otherprojectref99999.supabase.co';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /INCOMPATIBILIDADE DE PROJETO SUPABASE/
+  );
+});
+
+// -----------------------------------------------------------------------------
+// 5. Validações de SUPABASE_SERVICE_ROLE_KEY
+// -----------------------------------------------------------------------------
+runTestCase('5.1 Deve rejeitar SUPABASE_SERVICE_ROLE_KEY ausente', () => {
+  const env = getValidMockEnv();
+  delete env.SUPABASE_SERVICE_ROLE_KEY;
+  assert.throws(
+    () => validateStagingConfig(env),
+    /SUPABASE_SERVICE_ROLE_KEY NÃO DETECTADA/
+  );
+});
+
+runTestCase('5.2 Deve rejeitar SUPABASE_SERVICE_ROLE_KEY com placeholder (<...>)', () => {
+  const env = getValidMockEnv();
+  env.SUPABASE_SERVICE_ROLE_KEY = '<insira_aqui_a_service_role_key_de_staging>';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /SUPABASE_SERVICE_ROLE_KEY CONTÉM PLACEHOLDER/
+  );
+});
+
+// -----------------------------------------------------------------------------
+// 6. Validação de Carregamento Exclusivo de Arquivo .env.staging
+// -----------------------------------------------------------------------------
+runTestCase('6.1 Deve falhar imediatamente se .env.staging for obrigatório e estiver ausente', () => {
+  assert.throws(
+    () => loadStagingEnvironment({ customPath: '/caminho/ficticio/inexistente/.env.staging', requireFile: true }),
+    /ARQUIVO \.ENV\.STAGING AUSENTE/
+  );
+});
+
+// -----------------------------------------------------------------------------
+// 7. Validações de Porta do Servidor de Homologação (STAGING_PORT / PORT)
+// -----------------------------------------------------------------------------
+runTestCase('7.1 Deve adotar porta padrão 3001 quando STAGING_PORT e PORT não forem informados', () => {
+  const env = getValidMockEnv();
+  delete env.STAGING_PORT;
+  delete env.PORT;
+  const config = validateStagingConfig(env);
+  assert.equal(config.port, 3001);
+});
+
+runTestCase('7.2 Deve respeitar STAGING_PORT configurada explicitamente', () => {
+  const env = getValidMockEnv();
+  env.STAGING_PORT = '3002';
+  const config = validateStagingConfig(env);
+  assert.equal(config.port, 3002);
+});
+
+runTestCase('7.3 Deve aceitar PORT como fallback quando STAGING_PORT não estiver definida', () => {
+  const env = getValidMockEnv();
+  delete env.STAGING_PORT;
+  env.PORT = '8080';
+  const config = validateStagingConfig(env);
+  assert.equal(config.port, 8080);
+});
+
+runTestCase('7.4 Deve priorizar STAGING_PORT em relação a PORT quando ambas forem fornecidas', () => {
+  const env = getValidMockEnv();
+  env.STAGING_PORT = '3001';
+  env.PORT = '9000';
+  const config = validateStagingConfig(env);
+  assert.equal(config.port, 3001);
+});
+
+runTestCase('7.5 Deve rejeitar STAGING_PORT contendo marcadores de template (<...>)', () => {
+  const env = getValidMockEnv();
+  env.STAGING_PORT = '<insira_aqui_a_porta>';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /PORTA DE STAGING CONTÉM PLACEHOLDER/
+  );
+});
+
+runTestCase('7.6 Deve rejeitar STAGING_PORT não numérica', () => {
+  const env = getValidMockEnv();
+  env.STAGING_PORT = 'porta_invalida';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /PORTA DE STAGING INVÁLIDA/
+  );
+});
+
+runTestCase('7.7 Deve rejeitar STAGING_PORT não inteira / fracionária', () => {
+  const env = getValidMockEnv();
+  env.STAGING_PORT = '3001.5';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /PORTA DE STAGING INVÁLIDA/
+  );
+});
+
+runTestCase('7.8 Deve rejeitar STAGING_PORT menor que 1', () => {
+  const env = getValidMockEnv();
+  env.STAGING_PORT = '0';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /PORTA DE STAGING INVÁLIDA/
+  );
+});
+
+runTestCase('7.9 Deve rejeitar STAGING_PORT maior que 65535', () => {
+  const env = getValidMockEnv();
+  env.STAGING_PORT = '70000';
+  assert.throws(
+    () => validateStagingConfig(env),
+    /PORTA DE STAGING INVÁLIDA/
+  );
+});
+
+console.log('\n=============================================================================');
+console.log(`SUCESSO TOTAL: ${passedTests} de ${totalTests} testes unitários de falha segura APROVADOS!`);
+console.log('Todas as barreiras estáticas de isolamento comportaram-se como o esperado.');
+console.log('=============================================================================');
