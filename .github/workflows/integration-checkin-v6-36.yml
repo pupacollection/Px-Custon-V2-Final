@@ -55,10 +55,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm'
 
       - name: 3. Instalar Dependências
-        run: npm ci || npm install
+        run: npm install
 
       - name: 4. Validação Prévia Estática da v6.36
         run: npx tsx scripts/test-sql-v6-36-static-unit.ts
