@@ -1,0 +1,76 @@
+name: PX CUSTOM — Homologação Check-in v6.36 (PostgreSQL 16 Isolado)
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - staging
+    paths:
+      - 'supabase-homologacao-checkin-v6-36.sql'
+      - 'tests/integration/**'
+      - 'scripts/test-sql-v6-36-static-unit.ts'
+      - '.github/workflows/integration-checkin-v6-36.yml'
+  pull_request:
+    paths:
+      - 'supabase-homologacao-checkin-v6-36.sql'
+      - 'tests/integration/**'
+      - 'scripts/test-sql-v6-36-static-unit.ts'
+  workflow_dispatch:
+
+concurrency:
+  group: checkin-integration-v6-36-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration-postgres-16:
+    name: Execução Real de Integração em PostgreSQL 16 Descartável
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_staging_test_pw
+          POSTGRES_DB: px_custom_staging_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PG_ISOLATED_URL: postgres://postgres:postgres_staging_test_pw@127.0.0.1:5432/px_custom_staging_test
+      NODE_ENV: test
+      PX_ENV: staging
+
+    steps:
+      - name: 1. Checkout do Repositório
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: 3. Instalar Dependências
+        run: npm ci || npm install
+
+      - name: 4. Validação Prévia Estática da v6.36
+        run: npx tsx scripts/test-sql-v6-36-static-unit.ts
+
+      - name: 5. Executar Suíte Real de Integração INT-01 a INT-11 (PostgreSQL 16)
+        run: npx tsx tests/integration/staging-checkin-v6-36.test.ts
+
+      - name: 6. Auditoria de Concorrência e Logs de Validação
+        if: always()
+        run: |
+          echo "================================================================="
+          echo "RELATÓRIO DA EXECUÇÃO DOS TESTES DE INTEGRAÇÃO EM POSTGRESQL 16"
+          echo "Data/Hora UTC: $(date -u)"
+          echo "Commit: ${{ github.sha }}"
+          echo "================================================================="
